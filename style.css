@@ -765,7 +765,11 @@ button {
   object-fit: contain;
 }
 
-/* CHAMADA RECEBIDA */
+/* CHAMADA RECEBIDA — sempre por cima de tudo */
+.modal-backdrop.incoming-backdrop {
+  z-index: 9999;
+}
+
 .incoming-card {
   text-align: center;
   align-items: center;
@@ -782,6 +786,25 @@ button {
   border: 2px solid var(--accent-pink);
   color: var(--accent-pink);
   font-size: 28px;
+  animation: ringPulse 1.1s ease-in-out infinite;
+}
+
+@keyframes ringPulse {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(236, 72, 153, 0.45);
+  }
+  50% {
+    transform: scale(1.08);
+    box-shadow: 0 0 0 16px rgba(236, 72, 153, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .incoming-pulse {
+    animation: none;
+  }
 }
 
 .incoming-title {
@@ -936,7 +959,7 @@ button {
   position: relative;
   z-index: 3;
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   gap: 6px;
   padding: 14px 10px calc(18px + var(--safe-bottom));
   background: linear-gradient(to top, rgba(10, 9, 13, 0.94), transparent);
@@ -984,9 +1007,53 @@ button {
   color: #fda4af;
 }
 
+.call-action-item.muted-sound .call-ctrl-btn {
+  background: #4c1d2e;
+  border-color: var(--danger);
+  color: #fda4af;
+}
+
 .call-ctrl-btn.hangup {
   background: var(--danger);
   border-color: var(--danger);
+}
+
+/* TOAST FLUTUANTE DE NOVA MENSAGEM */
+.msg-toast {
+  position: fixed;
+  top: calc(12px + var(--safe-top));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9000;
+  max-width: 90%;
+  padding: 9px 16px;
+  border-radius: 999px;
+  background: rgba(36, 30, 45, 0.97);
+  border: 1px solid var(--accent-pink);
+  color: #fbcfe8;
+  font-size: 12.5px;
+  font-weight: 600;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.5);
+  animation: toastIn 0.22s ease-out;
+  pointer-events: none;
+}
+
+.msg-toast-text {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@keyframes toastIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -10px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
 }
 
 .ios-steps {

@@ -29,8 +29,9 @@ const MAX_RENDERED_MESSAGES = 80;
 const INITIAL_FETCH_LIMIT = 40;
 const IMAGE_MAX_SIDE_PX = 1024;
 const IMAGE_JPEG_QUALITY = 0.72;
-const WEBRTC_MAX_VIDEO_BITRATE_HD = 1100000;
+const WEBRTC_MAX_VIDEO_BITRATE_HD = 1200000;
 const WEBRTC_MAX_VIDEO_BITRATE_ECO = 550000;
+const AUDIO_RECORDER_BITRATE = 128000;
 
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -86,12 +87,16 @@ const state = {
   callMinimized: false,
   videoMode: 'off', // 'off' | 'camera' | 'screen'
   micMuted: false,
+  soundMuted: false,
   facingMode: 'user',
   ecoMode480p: false,
   callTimerId: null,
   callSeconds: 0,
   ringTimeoutId: null,
   callToastTimerId: null,
+  ringtoneTimerId: null,
+  iceRestartTimerId: null,
+  toastTimerId: null,
   wakeLock: null,
 
   swReg: null,
@@ -179,12 +184,16 @@ const el = {
   callToast: document.getElementById('call-toast'),
   toggleMicBtn: document.getElementById('toggle-mic-btn'),
   toggleCamBtn: document.getElementById('toggle-cam-btn'),
+  toggleSoundBtn: document.getElementById('toggle-sound-btn'),
   shareScreenBtn: document.getElementById('share-screen-btn'),
   switchCamBtn: document.getElementById('switch-cam-btn'),
   hangupBtn: document.getElementById('hangup-btn'),
 
   iosInstallModal: document.getElementById('ios-install-modal'),
-  closeIosModalBtn: document.getElementById('close-ios-modal-btn')
+  closeIosModalBtn: document.getElementById('close-ios-modal-btn'),
+
+  msgToast: document.getElementById('msg-toast'),
+  msgToastText: document.getElementById('msg-toast-text')
 };
 
 // ============================================================================
@@ -280,6 +289,80 @@ function playSoftTone(freqStart, freqEnd) {
     osc.start(now);
     osc.stop(now + 0.17);
   } catch (_) {}
+}
+
+// "Plim" discreto e agradável para nova mensagem (web audio, sem arquivos externos)
+function playMessagePlim() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!state.audioCtx) state.audioCtx = new Ctx();
+    if (state.audioCtx.state === 'suspended') state.audioCtx.resume();
+
+    const now = state.audioCtx.currentTime;
+    const osc = state.audioCtx.createOscillator();
+    const gain = state.audioCtx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(880, now);
+    osc.frequency.exponentialRampToValueAtTime(1320, now + 0.08);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.08, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+    osc.connect(gain);
+    gain.connect(state.audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.24);
+  } catch (_) {}
+}
+
+// Toque de chamada suave e discreto em loop (web audio, sem MP3)
+function startRingtone() {
+  stopRingtone();
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  try {
+    if (!state.audioCtx) state.audioCtx = new Ctx();
+    if (state.audioCtx.state === 'suspended') state.audioCtx.resume();
+
+    const playBell = () => {
+      if (!state.ringtoneTimerId) return;
+      const now = state.audioCtx.currentTime;
+      const notes = [1046.5, 1318.5, 1568.0];
+      notes.forEach((freq, idx) => {
+        const osc = state.audioCtx.createOscillator();
+        const gain = state.audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, now + idx * 0.16);
+        gain.gain.setValueAtTime(0.0001, now + idx * 0.16);
+        gain.gain.exponentialRampToValueAtTime(0.09, now + idx * 0.16 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.16 + 0.26);
+        osc.connect(gain);
+        gain.connect(state.audioCtx.destination);
+        osc.start(now + idx * 0.16);
+        osc.stop(now + idx * 0.16 + 0.28);
+      });
+    };
+
+    playBell();
+    state.ringtoneTimerId = setInterval(playBell, 1800);
+  } catch (_) {}
+}
+
+function stopRingtone() {
+  if (state.ringtoneTimerId) {
+    clearInterval(state.ringtoneTimerId);
+    state.ringtoneTimerId = null;
+  }
+}
+
+// Toast flutuante de nova mensagem no topo
+function showMsgToast(text) {
+  clearTimeout(state.toastTimerId);
+  el.msgToastText.textContent = text;
+  el.msgToast.classList.remove('hidden');
+  state.toastTimerId = setTimeout(() => {
+    el.msgToast.classList.add('hidden');
+  }, 4200);
 }
 
 function urlBase64ToUint8Array(base64String) {
@@ -638,16 +721,24 @@ function handleIncomingRealtimeMessage(msg) {
     state.partnerTyping = false;
     renderPartnerStatus(state.partnerOnlineRealtime, state.partnerLastSeen);
 
+    const preview =
+      msg.media_type === 'image'
+        ? '📷 Enviou uma foto'
+        : msg.media_type === 'audio'
+          ? '🎤 Enviou um áudio'
+          : msg.content || 'Nova mensagem';
+
     if (document.visibilityState === 'visible') {
-      playSoftTone(580, 760);
+      const viewport = el.messagesViewport;
+      const nearBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 120;
+      if (nearBottom && !state.inCall) {
+        playSoftTone(580, 760);
+      } else {
+        playMessagePlim();
+        showMsgToast(`${state.partnerName}: ${preview}`);
+      }
       markIncomingAsRead([msg.id]);
     } else {
-      const preview =
-        msg.media_type === 'image'
-          ? '📷 Enviou uma foto'
-          : msg.media_type === 'audio'
-            ? '🎤 Enviou um áudio'
-            : msg.content || 'Nova mensagem';
       notifyBackground(msg.sender_name, preview, 'msg-nosso-mundo');
     }
   }
@@ -1236,7 +1327,7 @@ async function startAudioRecording() {
     });
 
     const mimeType = pickAudioMimeType();
-    const options = { audioBitsPerSecond: 24000 };
+    const options = { audioBitsPerSecond: AUDIO_RECORDER_BITRATE };
     if (mimeType) options.mimeType = mimeType;
 
     const recorder = new MediaRecorder(stream, options);
@@ -1439,6 +1530,26 @@ function updateRemoteStageVisibility() {
   el.voiceStageFallback.classList.toggle('hidden', hasActiveRemoteVideo);
 }
 
+function preferVideoCodecs(pc) {
+  if (!pc || typeof pc.getTransceivers !== 'function') return;
+  try {
+    const caps = RTCRtpSender.getCapabilities('video');
+    if (!caps || !Array.isArray(caps.codecs)) return;
+    const preferred = caps.codecs.filter(
+      (c) => c.mimeType === 'video/H264' || c.mimeType === 'video/VP8'
+    );
+    if (preferred.length === 0) return;
+    for (const trans of pc.getTransceivers()) {
+      const isVideo =
+        (trans.sender && trans.sender.track && trans.sender.track.kind === 'video') ||
+        (trans.receiver && trans.receiver.track && trans.receiver.track.kind === 'video');
+      if (isVideo) {
+        try { trans.setCodecPreferences(preferred); } catch (_) {}
+      }
+    }
+  } catch (_) {}
+}
+
 function createPeerConnection() {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
@@ -1457,11 +1568,16 @@ function createPeerConnection() {
     if (event.track.kind === 'audio') {
       const audioOnlyStream = new MediaStream([event.track]);
       el.remoteAudio.srcObject = audioOnlyStream;
+      el.remoteAudio.muted = state.soundMuted;
+      el.remoteAudio.volume = state.soundMuted ? 0 : 1.0;
       el.remoteAudio.play().catch(() => {});
     }
 
     if (event.track.kind === 'video') {
       el.remoteVideo.srcObject = state.remoteStream;
+      el.remoteVideo.muted = state.soundMuted;
+      el.remoteVideo.volume = state.soundMuted ? 0 : 1.0;
+      el.remoteVideo.play().catch(() => {});
       event.track.onmute = updateRemoteStageVisibility;
       event.track.onunmute = updateRemoteStageVisibility;
       event.track.onended = updateRemoteStageVisibility;
@@ -1472,13 +1588,24 @@ function createPeerConnection() {
   pc.onconnectionstatechange = () => {
     const st = pc.connectionState;
     if (st === 'connected') {
+      clearTimeout(state.iceRestartTimerId);
       startCallTimer();
       applyVideoBitrateLimits(pc, state.ecoMode480p);
+      forcePlayRemoteMedia();
       updateMediaSessionForCall(true);
     } else if (st === 'failed' || st === 'closed') {
       endCall(false);
     } else if (st === 'disconnected') {
       el.callStateLabel.textContent = 'Reconectando...';
+      clearTimeout(state.iceRestartTimerId);
+      state.iceRestartTimerId = setTimeout(async () => {
+        if (!state.pc || state.pc.connectionState !== 'disconnected') return;
+        try {
+          const restartOffer = await state.pc.createOffer({ iceRestart: true });
+          await state.pc.setLocalDescription(restartOffer);
+          sendSignal('ice-restart-offer', restartOffer);
+        } catch (_) {}
+      }, 3000);
     }
   };
 
@@ -1493,6 +1620,7 @@ async function startOutgoingCall(withVideo) {
     state.callMinimized = false;
     state.pendingIceCandidates = [];
     state.micMuted = false;
+    state.soundMuted = false;
     state.facingMode = 'user';
     state.videoMode = withVideo ? 'camera' : 'off';
 
@@ -1518,6 +1646,7 @@ async function startOutgoingCall(withVideo) {
 
     updateCallUIState();
 
+    preferVideoCodecs(state.pc);
     const offer = await state.pc.createOffer();
     await state.pc.setLocalDescription(offer);
 
@@ -1538,10 +1667,13 @@ async function startOutgoingCall(withVideo) {
 async function acceptIncomingCall() {
   if (!state.pendingOffer) return;
 
+  stopRingtone();
+  el.incomingModal.classList.remove('incoming-backdrop');
   el.incomingModal.classList.add('hidden');
   state.inCall = true;
   state.callMinimized = false;
   state.micMuted = false;
+  state.soundMuted = false;
   state.facingMode = 'user';
   state.videoMode = state.pendingCallWithVideo ? 'camera' : 'off';
 
@@ -1577,10 +1709,12 @@ async function acceptIncomingCall() {
       } catch (_) {}
     }
 
+    preferVideoCodecs(state.pc);
     const answer = await state.pc.createAnswer();
     await state.pc.setLocalDescription(answer);
     await applyVideoBitrateLimits(state.pc, state.ecoMode480p);
 
+    forcePlayRemoteMedia();
     sendSignal('call-answer', answer);
   } catch (_) {
     endCall(true);
@@ -1588,6 +1722,8 @@ async function acceptIncomingCall() {
 }
 
 function rejectIncomingCall() {
+  stopRingtone();
+  el.incomingModal.classList.remove('incoming-backdrop');
   el.incomingModal.classList.add('hidden');
   state.pendingOffer = null;
   state.pendingIceCandidates = [];
@@ -1597,6 +1733,7 @@ function rejectIncomingCall() {
 async function renegotiateCall() {
   if (!state.pc) return;
   try {
+    preferVideoCodecs(state.pc);
     const offer = await state.pc.createOffer();
     await state.pc.setLocalDescription(offer);
     await applyVideoBitrateLimits(state.pc, state.ecoMode480p);
@@ -1619,9 +1756,10 @@ async function handleWebRTCSignal({ kind, from, data }) {
     el.incomingCallType.textContent = state.pendingCallWithVideo
       ? 'Ligação com vídeo e transmissão'
       : 'Ligação de voz (estilo Discord)';
+    el.incomingModal.classList.add('incoming-backdrop');
     el.incomingModal.classList.remove('hidden');
 
-    playSoftTone(660, 880);
+    startRingtone();
     notifyBackground(
       `${state.pendingCallerName} está ligando ♡`,
       state.pendingCallWithVideo ? 'Toque para atender o vídeo' : 'Toque para atender a voz',
@@ -1630,7 +1768,7 @@ async function handleWebRTCSignal({ kind, from, data }) {
 
     if (navigator.vibrate) {
       try {
-        navigator.vibrate([300, 150, 300, 150, 300]);
+        navigator.vibrate([400, 200, 400, 200, 400, 200, 400]);
       } catch (_) {}
     }
     return;
@@ -1638,6 +1776,7 @@ async function handleWebRTCSignal({ kind, from, data }) {
 
   if (kind === 'call-answer') {
     clearTimeout(state.ringTimeoutId);
+    stopRingtone();
     if (!state.pc) return;
     try {
       await state.pc.setRemoteDescription(new RTCSessionDescription(data));
@@ -1669,6 +1808,27 @@ async function handleWebRTCSignal({ kind, from, data }) {
     return;
   }
 
+  if (kind === 'ice-restart-offer') {
+    if (!state.pc) return;
+    try {
+      await state.pc.setRemoteDescription(new RTCSessionDescription(data));
+      preferVideoCodecs(state.pc);
+      const restartAnswer = await state.pc.createAnswer();
+      await state.pc.setLocalDescription(restartAnswer);
+      sendSignal('ice-restart-answer', restartAnswer);
+    } catch (_) {}
+    return;
+  }
+
+  if (kind === 'ice-restart-answer') {
+    if (!state.pc) return;
+    try {
+      await state.pc.setRemoteDescription(new RTCSessionDescription(data));
+      el.callStateLabel.textContent = 'Reconectado';
+    } catch (_) {}
+    return;
+  }
+
   if (kind === 'video-off-notify') {
     el.remoteVideo.classList.add('hidden');
     el.voiceStageFallback.classList.remove('hidden');
@@ -1696,6 +1856,8 @@ async function handleWebRTCSignal({ kind, from, data }) {
   }
 
   if (kind === 'call-reject' || kind === 'call-hangup') {
+    stopRingtone();
+    el.incomingModal.classList.remove('incoming-backdrop');
     el.incomingModal.classList.add('hidden');
     state.pendingOffer = null;
     state.pendingIceCandidates = [];
@@ -1754,12 +1916,41 @@ async function toggleLocalVideoMode(targetMode) {
       if (canDisplay) {
         const screenStream = await navigator.mediaDevices.getDisplayMedia({
           video: { width: { max: 1280 }, height: { max: 720 }, frameRate: { max: 30 } },
-          audio: false
+          audio: true
         });
         const screenTrack = screenStream.getVideoTracks()[0];
+        const screenAudioTrack = screenStream.getAudioTracks()[0];
+
+        // Mistura áudio da tela com o microfone (voz continua ativa, sem cortes)
+        if (screenAudioTrack && state.localAudioStream && state.pc) {
+          try {
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            const mixCtx = new Ctx();
+            const dest = mixCtx.createMediaStreamDestination();
+            mixCtx.createMediaStreamSource(new MediaStream([screenAudioTrack])).connect(dest);
+            mixCtx.createMediaStreamSource(state.localAudioStream).connect(dest);
+            const mixedTrack = dest.stream.getAudioTracks()[0];
+            const audioSender = state.pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
+            if (audioSender) {
+              state.screenMixCtx = mixCtx;
+              await audioSender.replaceTrack(mixedTrack);
+            } else {
+              mixCtx.close();
+            }
+          } catch (_) {}
+        }
+
         if (screenTrack) {
           screenTrack.onended = () => {
             if (state.videoMode === 'screen') {
+              if (state.screenMixCtx) {
+                try { state.screenMixCtx.close(); } catch (_) {}
+                state.screenMixCtx = null;
+                const audioSender = state.pc && state.pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
+                if (audioSender && state.localAudioStream) {
+                  audioSender.replaceTrack(state.localAudioStream.getAudioTracks()[0]).catch(() => {});
+                }
+              }
               stopLocalVideoTrack();
               state.videoMode = 'off';
               updateCallUIState();
@@ -1855,7 +2046,31 @@ function toggleMic() {
   state.localAudioStream.getAudioTracks().forEach((t) => {
     t.enabled = !state.micMuted;
   });
+  showCallToast(state.micMuted ? 'Microfone mutado' : 'Microfone ativo');
   updateCallUIState();
+}
+
+function toggleSound() {
+  state.soundMuted = !state.soundMuted;
+  el.remoteAudio.muted = state.soundMuted;
+  el.remoteVideo.muted = state.soundMuted;
+  if (!state.soundMuted) {
+    el.remoteAudio.volume = 1.0;
+    el.remoteVideo.volume = 1.0;
+    el.remoteAudio.play().catch(() => {});
+    el.remoteVideo.play().catch(() => {});
+  }
+  showCallToast(state.soundMuted ? 'Áudio do parceiro silenciado' : 'Áudio do parceiro ativo');
+  updateCallUIState();
+}
+
+function forcePlayRemoteMedia() {
+  el.remoteAudio.muted = state.soundMuted;
+  el.remoteVideo.muted = state.soundMuted;
+  el.remoteAudio.volume = state.soundMuted ? 0 : 1.0;
+  el.remoteVideo.volume = state.soundMuted ? 0 : 1.0;
+  el.remoteAudio.play().catch(() => {});
+  el.remoteVideo.play().catch(() => {});
 }
 
 function minimizeCallToChat() {
@@ -1879,6 +2094,7 @@ function updateCallUIState() {
   el.switchCamBtn.disabled = state.videoMode === 'screen';
 
   el.toggleMicBtn.classList.toggle('muted', state.micMuted);
+  el.toggleSoundBtn.classList.toggle('muted-sound', state.soundMuted);
   el.toggleCamBtn.classList.toggle('active-feature', state.videoMode === 'camera');
   el.shareScreenBtn.classList.toggle('active-feature', state.videoMode === 'screen');
   manageWakeLock(hasLocalVideo);
@@ -1910,7 +2126,13 @@ function startCallTimer() {
 function endCall(notifyPeer) {
   clearTimeout(state.ringTimeoutId);
   clearTimeout(state.callToastTimerId);
+  clearTimeout(state.iceRestartTimerId);
   clearInterval(state.callTimerId);
+  stopRingtone();
+  if (state.screenMixCtx) {
+    try { state.screenMixCtx.close(); } catch (_) {}
+    state.screenMixCtx = null;
+  }
   state.callTimerId = null;
   state.callSeconds = 0;
 
@@ -1949,6 +2171,7 @@ function endCall(notifyPeer) {
   el.callToast.classList.add('hidden');
   el.videoOverlay.classList.add('hidden');
   el.activeCallBanner.classList.add('hidden');
+  el.incomingModal.classList.remove('incoming-backdrop');
   el.incomingModal.classList.add('hidden');
 }
 
@@ -2008,6 +2231,7 @@ function bindEvents() {
   el.bannerHangupBtn.addEventListener('click', () => endCall(true));
 
   el.toggleMicBtn.addEventListener('click', toggleMic);
+  el.toggleSoundBtn.addEventListener('click', toggleSound);
   el.toggleCamBtn.addEventListener('click', () => toggleLocalVideoMode('camera'));
   el.shareScreenBtn.addEventListener('click', () => toggleLocalVideoMode('screen'));
   el.switchCamBtn.addEventListener('click', switchCamera);

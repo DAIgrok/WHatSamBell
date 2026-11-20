@@ -176,6 +176,11 @@
         <button id="chat-alert-close" type="button" class="alert-close-btn" aria-label="Fechar aviso">✕</button>
       </div>
 
+      <!-- Toast flutuante de nova mensagem -->
+      <div id="msg-toast" class="msg-toast hidden" role="status" aria-live="polite">
+        <span id="msg-toast-text" class="msg-toast-text"></span>
+      </div>
+
       <!-- Mini barra de ligação ativa estilo Discord -->
       <div id="active-call-banner" class="active-call-banner hidden" role="region" aria-label="Ligação em andamento">
         <div class="call-banner-info">
@@ -310,7 +315,7 @@
 
     <!-- OVERLAY: PALCO DA LIGAÇÃO / TRANSMISSÃO (ESTILO DISCORD) -->
     <div id="video-call-overlay" class="video-overlay hidden" role="dialog" aria-modal="true" aria-label="Ligação em andamento">
-      <video id="remote-video" class="remote-video hidden" autoplay playsinline muted></video>
+      <video id="remote-video" class="remote-video hidden" autoplay playsinline></video>
       <div id="voice-stage-fallback" class="voice-stage-fallback">
         <div id="stage-avatar" class="stage-avatar">S</div>
         <p id="stage-subtitle" class="stage-subtitle">Ligação de voz ativa • segundo plano pronto</p>
@@ -377,6 +382,16 @@
             </svg>
           </span>
           <span class="call-ctrl-label">Virar</span>
+        </button>
+
+        <button id="toggle-sound-btn" type="button" class="call-action-item" aria-label="Silenciar áudio que ouço da outra pessoa">
+          <span class="call-ctrl-btn">
+            <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M11 5L6 9H2v6h4l5 4V5z" />
+              <path d="M23 9l-6 6M17 9l6 6" />
+            </svg>
+          </span>
+          <span class="call-ctrl-label">Silenciar</span>
         </button>
 
         <button id="hangup-btn" type="button" class="call-action-item" aria-label="Encerrar ligação">
