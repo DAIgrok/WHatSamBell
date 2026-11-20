@@ -1,0 +1,6 @@
+{
+  "name": "Nosso Mundo ♡",
+  "description": "PWA privado de comunicação em tempo real, áudio, fotos e chamada de vídeo em baixa latência para 2 pessoas, otimizado para Android.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Nosso Mundo ♡</title>
+    <meta
+      name="description"
+      content="PWA privado para Gabriel e Samella: chat em tempo real, áudio, fotos, visto e ligação com transmissão em baixa latência."
+    />
+    <meta property="og:title" content="Nosso Mundo ♡" />
+    <meta
+      property="og:description"
+      content="Chat privado com fotos, áudios, visto, online/offline e ligação com transmissão em tempo real."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="theme-color" content="#121212" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Nosso Mundo" />
+
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="stylesheet" href="./style.css" />
+
+    <!-- Supabase JS v2 via CDN (ultra-leve, sem frameworks pesados) -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div id="offline-banner" class="offline-banner hidden" role="status" aria-live="polite">
+      <span class="offline-dot"></span>
+      <span>Sem internet — aguardando conexão</span>
+    </div>
+
+    <!-- TELA 1: ACESSO PRIVADO (GABRIEL / SAMELLA) -->
+    <main id="lock-screen" class="lock-screen">
+      <section class="lock-card" aria-labelledby="app-title">
+        <div class="brand-badge" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor">
+            <path
+              d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"
+            />
+          </svg>
+        </div>
+
+        <h1 id="app-title" class="lock-title">Nosso Mundo ♡</h1>
+        <p class="lock-subtitle">Chat privado • Gabriel &amp; Samella</p>
+
+        <form id="unlock-form" class="lock-form" novalidate>
+          <div class="field-group">
+            <span class="field-label">Quem está entrando?</span>
+            <div class="role-selector" role="radiogroup" aria-label="Selecionar usuário">
+              <button type="button" class="role-btn active" data-user="Gabriel" aria-pressed="true">
+                Gabriel
+              </button>
+              <button type="button" class="role-btn" data-user="Samella" aria-pressed="false">
+                Samella
+              </button>
+            </div>
+          </div>
+
+          <div class="field-group">
+            <label for="passcode-input" class="field-label">Sua senha</label>
+            <input
+              id="passcode-input"
+              type="password"
+              inputmode="numeric"
+              class="text-input"
+              maxlength="12"
+              autocomplete="current-password"
+              placeholder="Digite sua senha"
+              required
+            />
+          </div>
+
+          <p id="lock-error" class="error-text hidden" role="alert"></p>
+
+          <button id="unlock-btn" type="submit" class="primary-btn">Entrar no Chat</button>
+        </form>
+
+        <button id="install-pwa-lock-btn" type="button" class="install-btn hidden">
+          Instalar App no Celular
+        </button>
+      </section>
+    </main>
+
+    <!-- TELA 2: CHAT + LIGAÇÃO + TRANSMISSÃO -->
+    <div id="chat-screen" class="chat-screen hidden">
+      <header class="chat-header">
+        <div class="header-left">
+          <div id="partner-avatar" class="avatar-dot" aria-hidden="true">S</div>
+          <div class="header-meta">
+            <h2 id="partner-name-header" class="header-title">Samella</h2>
+            <p id="presence-status" class="presence-text">
+              <span id="presence-dot" class="status-dot"></span>
+              <span id="presence-label">Offline</span>
+            </p>
+          </div>
+        </div>
+
+        <div class="header-actions">
+          <button
+            id="notif-btn"
+            type="button"
+            class="icon-btn"
+            title="Ativar notificações push"
+            aria-label="Ativar notificações push"
+          >
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M18 8a6 6 0 10-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 01-3.46 0" />
+            </svg>
+          </button>
+
+          <button
+            id="install-pwa-btn"
+            type="button"
+            class="icon-btn accent-subtle hidden"
+            title="Instalar aplicativo"
+            aria-label="Instalar aplicativo"
+          >
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" />
+            </svg>
+          </button>
+
+          <!-- Ligação de voz -->
+          <button
+            id="start-voice-call-btn"
+            type="button"
+            class="icon-btn voice-trigger"
+            title="Ligação de voz (roda em segundo plano)"
+            aria-label="Ligação de voz"
+          >
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72 12.84 12.84 0 00.7 2.81 2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45 12.84 12.84 0 002.81.7A2 2 0 0122 16.92z" />
+            </svg>
+          </button>
+
+          <!-- Ligação com vídeo / transmissão -->
+          <button
+            id="start-video-call-btn"
+            type="button"
+            class="icon-btn video-trigger"
+            title="Ligação com vídeo e transmissão"
+            aria-label="Ligação com vídeo e transmissão"
+          >
+            <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M15 10l4.55-2.28A1 1 0 0121 8.62v6.76a1 1 0 01-1.45.89L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+          </button>
+
+          <button
+            id="lock-app-btn"
+            type="button"
+            class="icon-btn"
+            title="Sair / Bloquear"
+            aria-label="Sair / Bloquear"
+          >
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2" />
+              <path d="M7 11V7a5 5 0 0110 0v4" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- Barra de alerta de notificações / conexão -->
+      <div id="chat-alert-banner" class="chat-alert-banner hidden" role="status">
+        <span id="chat-alert-text"></span>
+        <button id="chat-alert-close" type="button" class="alert-close-btn" aria-label="Fechar aviso">✕</button>
+      </div>
+
+      <!-- Mini barra de ligação ativa estilo Discord -->
+      <div id="active-call-banner" class="active-call-banner hidden" role="region" aria-label="Ligação em andamento">
+        <div class="call-banner-info">
+          <span class="call-live-dot"></span>
+          <span id="call-banner-text">Em ligação • 00:00</span>
+        </div>
+        <div class="call-banner-actions">
+          <button id="return-to-call-btn" type="button" class="call-banner-btn">Abrir call</button>
+          <button id="banner-hangup-btn" type="button" class="call-banner-hangup">Desligar</button>
+        </div>
+      </div>
+
+      <section id="messages-viewport" class="messages-viewport" aria-label="Mensagens">
+        <button id="load-older-btn" type="button" class="load-older-btn hidden">
+          Carregar mensagens anteriores
+        </button>
+        <div id="messages-list" class="messages-list"></div>
+      </section>
+
+      <!-- Barra de gravação de áudio -->
+      <div id="recording-bar" class="recording-bar hidden" role="region" aria-label="Gravação de áudio">
+        <button id="cancel-record-btn" type="button" class="record-cancel-btn" aria-label="Cancelar áudio">
+          Cancelar
+        </button>
+        <div class="record-status">
+          <span class="rec-pulse"></span>
+          <span id="record-timer" class="rec-timer">00:00</span>
+        </div>
+        <button id="send-record-btn" type="button" class="record-send-btn">Enviar áudio</button>
+      </div>
+
+      <!-- Barra de envio -->
+      <footer id="composer-bar" class="composer-bar">
+        <input id="photo-input" type="file" accept="image/*" class="hidden" />
+        <button
+          id="photo-btn"
+          type="button"
+          class="composer-icon-btn"
+          title="Enviar foto"
+          aria-label="Enviar foto"
+        >
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="18" height="18" rx="3" />
+            <circle cx="8.5" cy="8.5" r="1.5" />
+            <path d="M21 15l-5-5L5 21" />
+          </svg>
+        </button>
+
+        <textarea
+          id="message-input"
+          class="message-input"
+          rows="1"
+          maxlength="2000"
+          placeholder="Mensagem..."
+          aria-label="Escreva uma mensagem"
+        ></textarea>
+
+        <button
+          id="record-btn"
+          type="button"
+          class="composer-icon-btn"
+          title="Gravar mensagem de voz"
+          aria-label="Gravar mensagem de voz"
+        >
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="9" y="2" width="6" height="12" rx="3" />
+            <path d="M5 10v1a7 7 0 0014 0v-1M12 18v4M8 22h8" />
+          </svg>
+        </button>
+
+        <button
+          id="send-btn"
+          type="button"
+          class="send-btn hidden"
+          title="Enviar mensagem"
+          aria-label="Enviar mensagem"
+        >
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+          </svg>
+        </button>
+      </footer>
+    </div>
+
+    <!-- Áudio dedicado da chamada (continua tocando em segundo plano igual Discord) -->
+    <audio id="remote-audio" autoplay playsinline></audio>
+
+    <!-- MODAL: PRÉVIA DE FOTO COMPRIMIDA -->
+    <div id="photo-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Prévia da foto">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Enviar foto</h3>
+          <span id="photo-size-badge" class="size-badge">Comprimindo...</span>
+        </div>
+        <div class="photo-preview-wrap">
+          <img id="photo-preview-img" class="photo-preview-img" alt="Prévia da foto comprimida" />
+        </div>
+        <input
+          id="photo-caption-input"
+          type="text"
+          class="text-input"
+          maxlength="300"
+          placeholder="Legenda opcional..."
+        />
+        <div class="modal-actions">
+          <button id="cancel-photo-btn" type="button" class="secondary-btn">Cancelar</button>
+          <button id="confirm-photo-btn" type="button" class="primary-btn">Enviar foto</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODAL: ZOOM DE FOTO -->
+    <div id="lightbox-modal" class="lightbox-modal hidden" role="dialog" aria-modal="true" aria-label="Visualizar foto">
+      <button id="close-lightbox-btn" type="button" class="lightbox-close" aria-label="Fechar foto">
+        ✕
+      </button>
+      <img id="lightbox-img" class="lightbox-img" alt="Foto ampliada" />
+    </div>
+
+    <!-- MODAL: CHAMADA RECEBIDA -->
+    <div id="incoming-call-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Chamada recebida">
+      <div class="modal-card incoming-card">
+        <div class="incoming-pulse">♡</div>
+        <h3 id="incoming-caller-name" class="incoming-title">Chamada recebida</h3>
+        <p id="incoming-call-type" class="incoming-subtitle">Ligação em tempo real</p>
+        <div class="modal-actions">
+          <button id="reject-call-btn" type="button" class="danger-btn">Recusar</button>
+          <button id="accept-call-btn" type="button" class="accept-btn">Atender</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- OVERLAY: PALCO DA LIGAÇÃO / TRANSMISSÃO (ESTILO DISCORD) -->
+    <div id="video-call-overlay" class="video-overlay hidden" role="dialog" aria-modal="true" aria-label="Ligação em andamento">
+      <video id="remote-video" class="remote-video hidden" autoplay playsinline muted></video>
+      <div id="voice-stage-fallback" class="voice-stage-fallback">
+        <div id="stage-avatar" class="stage-avatar">S</div>
+        <p id="stage-subtitle" class="stage-subtitle">Ligação de voz ativa • segundo plano pronto</p>
+      </div>
+
+      <video id="local-video" class="local-video hidden" autoplay playsinline muted></video>
+
+      <div class="call-top-bar">
+        <div class="call-top-left">
+          <button id="minimize-call-btn" type="button" class="call-mini-btn" title="Ir para o chat sem desligar" aria-label="Minimizar para o chat">
+            ↓ Chat
+          </button>
+          <div>
+            <p id="call-partner-label" class="call-name">Samella</p>
+            <p id="call-state-label" class="call-state">Conectando...</p>
+          </div>
+        </div>
+        <button
+          id="eco-mode-btn"
+          type="button"
+          class="eco-btn"
+          title="Alternar entre 720p HD e 480p Eco (Galaxy J5)"
+        >
+          720p HD
+        </button>
+      </div>
+
+      <p id="call-toast" class="call-toast hidden" role="status"></p>
+
+      <div class="call-controls">
+        <button id="toggle-mic-btn" type="button" class="call-action-item" aria-label="Silenciar microfone">
+          <span class="call-ctrl-btn">
+            <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="9" y="2" width="6" height="12" rx="3" />
+              <path d="M5 10v1a7 7 0 0014 0v-1M12 18v4M8 22h8" />
+            </svg>
+          </span>
+          <span class="call-ctrl-label">Mic</span>
+        </button>
+
+        <button id="toggle-cam-btn" type="button" class="call-action-item" aria-label="Ligar ou desligar câmera">
+          <span class="call-ctrl-btn">
+            <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M15 10l4.55-2.28A1 1 0 0121 8.62v6.76a1 1 0 01-1.45.89L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+          </span>
+          <span class="call-ctrl-label">Câmera</span>
+        </button>
+
+        <button id="share-screen-btn" type="button" class="call-action-item" aria-label="Transmitir tela ou vídeo">
+          <span class="call-ctrl-btn">
+            <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="3" width="20" height="14" rx="2" />
+              <path d="M8 21h8M12 17v4M9 10l3-3 3 3M12 7v7" />
+            </svg>
+          </span>
+          <span class="call-ctrl-label">Transmitir</span>
+        </button>
+
+        <button id="switch-cam-btn" type="button" class="call-action-item" aria-label="Trocar câmera frontal e traseira">
+          <span class="call-ctrl-btn">
+            <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M20 11a8.1 8.1 0 00-15.5-2m-.5-4v4h4M4 13a8.1 8.1 0 0015.5 2m.5 4v-4h-4" />
+            </svg>
+          </span>
+          <span class="call-ctrl-label">Virar</span>
+        </button>
+
+        <button id="hangup-btn" type="button" class="call-action-item" aria-label="Encerrar ligação">
+          <span class="call-ctrl-btn hangup">
+            <svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor">
+              <path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a.956.956 0 01-.29-.7c0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28a11.27 11.27 0 00-2.67-1.85.996.996 0 01-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z" />
+            </svg>
+          </span>
+          <span class="call-ctrl-label">Sair</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- MODAL: GUIA DE INSTALAÇÃO IOS SAFARI -->
+    <div id="ios-install-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Instalar no iPhone">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Instalar no iPhone / iPad</h3>
+        </div>
+        <p class="ios-steps">
+          1. Toque no botão <strong>Compartilhar</strong> na barra inferior do Safari.<br />
+          2. Role para baixo e toque em <strong>Adicionar à Tela de Início</strong>.
+        </p>
+        <button id="close-ios-modal-btn" type="button" class="primary-btn">Entendi</button>
+      </div>
+    </div>
+  </body>
+</html>
