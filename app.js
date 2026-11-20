@@ -1,11 +1,12 @@
 /* ============================================================================
    NOSSO MUNDO ♡ — VANILLA JS (ES6+) ULTRA-LEVE PARA GALAXY J5
-   - Usuários: Gabriel (2010) e Samella (2011)
-   - Chat em Tempo Real duplo (Supabase Postgres Changes + WebSocket Broadcast)
-   - Visto WhatsApp (✓ / ✓✓ / ✓✓ azul) + Digitando... + Online / Visto por último
-   - Fotos comprimidas (Canvas) + Áudios (MediaRecorder)
-   - Ligação em tempo real (Voz + Câmera 720p@30fps + Botão Virar Câmera + Transmitir)
-   - Notificações Push / Service Worker + MediaSession em segundo plano
+   - Usuários: Gabriel (2010) e Samella (2011) — sessão apenas em sessionStorage
+   - Chat em Tempo Real duplo (Supabase Postgres Changes + Broadcast)
+   - Menu ⋮ (Limpar mensagens) + Fotos Instagram (Normal, Dupla 2x, Apagar)
+   - WebRTC canal único 'nosso-mundo-webrtc' + fila ICE + restartIce()
+   - Transmissão de Tela 720p@30fps 1.2Mbps H.264/VP8 + Áudio isolado ao mutar mic
+   - Chat invisível estilo Twitch (só texto) + ponto vermelho estilo Discord
+   - Barra WhatsApp auto-ocultável + troca PiP + Tela Cheia + Áudio 48kHz / 128kbps
    ============================================================================ */
 
 'use strict';
@@ -16,7 +17,7 @@
 const SUPABASE_URL = 'https://nigimqjplcczxcbygjba.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_tnBcF8zySL-fuXSnlswfrA_p6afpsYz';
 
-// Opcional: cole aqui uma chave pública VAPID se configurar uma Edge Function de Push
+// Opcional: chave pública VAPID caso configure Edge Function de Web Push
 const VAPID_PUBLIC_KEY = '';
 
 const USERS = {
@@ -26,12 +27,17 @@ const USERS = {
 
 // Limites rígidos de hardware para o Samsung Galaxy J5 (1.5GB/2GB RAM)
 const MAX_RENDERED_MESSAGES = 80;
+const MAX_CALL_CHAT_MESSAGES = 20;
 const INITIAL_FETCH_LIMIT = 40;
 const IMAGE_MAX_SIDE_PX = 1024;
 const IMAGE_JPEG_QUALITY = 0.72;
 const WEBRTC_MAX_VIDEO_BITRATE_HD = 1200000;
 const WEBRTC_MAX_VIDEO_BITRATE_ECO = 550000;
 const AUDIO_RECORDER_BITRATE = 128000;
+const CONTROLS_AUTOHIDE_MS = 5000;
+
+const PHOTO_2X_PREFIX = '__NM2X__:';
+const MSG_DELETED_MARKER = '__NM_DELETED__';
 
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -46,12 +52,11 @@ const ICE_SERVERS = [
 const state = {
   supabase: null,
   chatChannel: null,
-  signalChannel: null,
   callChannel: null,
   presenceChannel: null,
   statusChannel: null,
 
-  currentUser: sessionStorage.getItem('nm_user') || localStorage.getItem('nm_last_user') || 'Gabriel',
+  currentUser: sessionStorage.getItem('nm_user') || 'Gabriel',
   partnerName: 'Samella',
   unlocked: sessionStorage.getItem('nm_unlocked') === '1',
   partnerOnlineRealtime: false,
@@ -59,8 +64,11 @@ const state = {
   partnerTyping: false,
   partnerTypingTimer: null,
   lastTypingSentAt: 0,
+  clearedAtIso: sessionStorage.getItem('nm_cleared_at') || null,
 
   renderedIds: new Set(),
+  callChatIds: new Set(),
+  messageCache: new Map(),
   oldestTimestamp: null,
   newestTimestamp: null,
   hasMoreOlder: false,
@@ -68,6 +76,9 @@ const state = {
 
   pendingPhotoBlob: null,
   pendingPhotoPreviewUrl: null,
+  pendingPhotoMode: 'normal', // 'normal' | 'double'
+  activeLightboxMsg: null,
+  confirmActionCallback: null,
 
   mediaRecorder: null,
   recordingStream: null,
@@ -80,17 +91,29 @@ const state = {
   localAudioStream: null,
   localVideoStream: null,
   remoteStream: null,
+  screenMixCtx: null,
+  screenMixMicGain: null,
+  screenMixScreenGain: null,
+  screenAudioTrack: null,
   pendingOffer: null,
   pendingCallerName: null,
   pendingCallWithVideo: false,
   pendingIceCandidates: [],
   inCall: false,
+  incomingRinging: false,
   callMinimized: false,
   videoMode: 'off', // 'off' | 'camera' | 'screen'
+  remoteVideoMode: 'off', // 'off' | 'camera' | 'screen'
   micMuted: false,
   soundMuted: false,
   facingMode: 'user',
   ecoMode480p: false,
+  pipSwapped: false,
+  controlsHidden: false,
+  isStageRotated: false,
+  callChatOpen: false,
+  inCallUnreadCount: 0,
+  controlsAutoHideTimerId: null,
   callTimerId: null,
   callSeconds: 0,
   ringTimeoutId: null,
@@ -122,10 +145,14 @@ const el = {
   partnerNameHeader: document.getElementById('partner-name-header'),
   presenceDot: document.getElementById('presence-dot'),
   presenceLabel: document.getElementById('presence-label'),
-  notifBtn: document.getElementById('notif-btn'),
-  installBtn: document.getElementById('install-pwa-btn'),
   startVoiceBtn: document.getElementById('start-voice-call-btn'),
   startVideoBtn: document.getElementById('start-video-call-btn'),
+  menuDotsBtn: document.getElementById('menu-dots-btn'),
+  headerMenuPopover: document.getElementById('header-menu-popover'),
+  clearChatBtn: document.getElementById('clear-chat-btn'),
+  notifBtn: document.getElementById('notif-btn'),
+  notifBtnLabel: document.getElementById('notif-btn-label'),
+  installBtn: document.getElementById('install-pwa-btn'),
   lockAppBtn: document.getElementById('lock-app-btn'),
 
   chatAlertBanner: document.getElementById('chat-alert-banner'),
@@ -158,13 +185,22 @@ const el = {
   photoModal: document.getElementById('photo-modal'),
   photoSizeBadge: document.getElementById('photo-size-badge'),
   photoPreviewImg: document.getElementById('photo-preview-img'),
+  photoModeButtons: document.querySelectorAll('[data-photo-mode]'),
   photoCaptionInput: document.getElementById('photo-caption-input'),
   cancelPhotoBtn: document.getElementById('cancel-photo-btn'),
   confirmPhotoBtn: document.getElementById('confirm-photo-btn'),
 
   lightboxModal: document.getElementById('lightbox-modal'),
+  lightboxBadge: document.getElementById('lightbox-badge'),
+  lightboxDeleteBtn: document.getElementById('lightbox-delete-btn'),
   lightboxImg: document.getElementById('lightbox-img'),
   closeLightboxBtn: document.getElementById('close-lightbox-btn'),
+
+  confirmModal: document.getElementById('confirm-modal'),
+  confirmTitle: document.getElementById('confirm-title'),
+  confirmMessage: document.getElementById('confirm-message'),
+  confirmCancelBtn: document.getElementById('confirm-cancel-btn'),
+  confirmAcceptBtn: document.getElementById('confirm-accept-btn'),
 
   incomingModal: document.getElementById('incoming-call-modal'),
   incomingCallerName: document.getElementById('incoming-caller-name'),
@@ -181,13 +217,21 @@ const el = {
   minimizeCallBtn: document.getElementById('minimize-call-btn'),
   callPartnerLabel: document.getElementById('call-partner-label'),
   callStateLabel: document.getElementById('call-state-label'),
+  rotateStageBtn: document.getElementById('rotate-stage-btn'),
   ecoModeBtn: document.getElementById('eco-mode-btn'),
   callToast: document.getElementById('call-toast'),
+  callChatOverlay: document.getElementById('call-chat-overlay'),
+  callChatMessages: document.getElementById('call-chat-messages'),
+  callChatForm: document.getElementById('call-chat-form'),
+  callChatInput: document.getElementById('call-chat-input'),
   toggleMicBtn: document.getElementById('toggle-mic-btn'),
   toggleCamBtn: document.getElementById('toggle-cam-btn'),
-  toggleSoundBtn: document.getElementById('toggle-sound-btn'),
-  shareScreenBtn: document.getElementById('share-screen-btn'),
   switchCamBtn: document.getElementById('switch-cam-btn'),
+  shareScreenBtn: document.getElementById('share-screen-btn'),
+  toggleSoundBtn: document.getElementById('toggle-sound-btn'),
+  toggleCallChatBtn: document.getElementById('toggle-call-chat-btn'),
+  callChatBadge: document.getElementById('call-chat-badge'),
+  toggleFullscreenBtn: document.getElementById('toggle-fullscreen-btn'),
   hangupBtn: document.getElementById('hangup-btn'),
 
   iosInstallModal: document.getElementById('ios-install-modal'),
@@ -270,7 +314,21 @@ function showCallToast(text) {
   }, 4000);
 }
 
+function openConfirmModal(title, message, confirmLabel, callback) {
+  el.confirmTitle.textContent = title;
+  el.confirmMessage.textContent = message;
+  el.confirmAcceptBtn.textContent = confirmLabel || 'Confirmar';
+  state.confirmActionCallback = callback;
+  el.confirmModal.classList.remove('hidden');
+}
+
+function closeConfirmModal() {
+  el.confirmModal.classList.add('hidden');
+  state.confirmActionCallback = null;
+}
+
 function playSoftTone(freqStart, freqEnd) {
+  if (state.inCall || state.incomingRinging) return;
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return;
@@ -292,8 +350,8 @@ function playSoftTone(freqStart, freqEnd) {
   } catch (_) {}
 }
 
-// "Plim" discreto e agradável para nova mensagem (web audio, sem arquivos externos)
 function playMessagePlim() {
+  if (state.inCall || state.incomingRinging) return;
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return;
@@ -316,7 +374,6 @@ function playMessagePlim() {
   } catch (_) {}
 }
 
-// Toque de chamada suave e discreto em loop (web audio, sem MP3)
 function startRingtone() {
   stopRingtone();
   const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -356,8 +413,8 @@ function stopRingtone() {
   }
 }
 
-// Toast flutuante de nova mensagem no topo
 function showMsgToast(text) {
+  if (state.inCall || state.incomingRinging) return;
   clearTimeout(state.toastTimerId);
   el.msgToastText.textContent = text;
   el.msgToast.classList.remove('hidden');
@@ -378,6 +435,47 @@ function urlBase64ToUint8Array(base64String) {
 }
 
 // ============================================================================
+// METADADOS DE FOTOS (NORMAL, VISUALIZAÇÃO DUPLA 2X E EXCLUSÃO)
+// ============================================================================
+function parsePhotoMeta(msg) {
+  const raw = msg && typeof msg.content === 'string' ? msg.content : '';
+  if (raw === MSG_DELETED_MARKER) {
+    return { deleted: true, isDouble: false, viewsLeft: 0, caption: '' };
+  }
+  if (raw.startsWith(PHOTO_2X_PREFIX)) {
+    const rest = raw.slice(PHOTO_2X_PREFIX.length);
+    const sepIdx = rest.indexOf('|');
+    const countStr = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
+    const caption = sepIdx === -1 ? '' : rest.slice(sepIdx + 1);
+    const viewsLeft = Math.max(0, Number.parseInt(countStr, 10) || 0);
+    return { deleted: false, isDouble: true, viewsLeft, caption };
+  }
+  return { deleted: false, isDouble: false, viewsLeft: Infinity, caption: raw };
+}
+
+function serializePhotoMeta(isDouble, viewsLeft, caption) {
+  if (!isDouble) return caption || null;
+  return `${PHOTO_2X_PREFIX}${Math.max(0, viewsLeft)}|${caption || ''}`;
+}
+
+function extractStoragePathFromPublicUrl(publicUrl) {
+  if (!publicUrl || typeof publicUrl !== 'string') return null;
+  const marker = '/storage/v1/object/public/chat-media/';
+  const idx = publicUrl.indexOf(marker);
+  if (idx === -1) return null;
+  return decodeURIComponent(publicUrl.slice(idx + marker.length).split('?')[0]);
+}
+
+async function removeMediaFromStorage(publicUrl) {
+  if (!state.supabase || !publicUrl) return;
+  const path = extractStoragePathFromPublicUrl(publicUrl);
+  if (!path) return;
+  try {
+    await state.supabase.storage.from('chat-media').remove([path]);
+  } catch (_) {}
+}
+
+// ============================================================================
 // PWA, PUSH NOTIFICATIONS E PERSISTÊNCIA EM SEGUNDO PLANO
 // ============================================================================
 function updateNotifButtonVisual() {
@@ -387,7 +485,9 @@ function updateNotifButtonVisual() {
   }
   const granted = Notification.permission === 'granted';
   el.notifBtn.classList.toggle('notif-enabled', granted);
-  el.notifBtn.title = granted ? 'Notificações push ativadas' : 'Ativar notificações push';
+  if (el.notifBtnLabel) {
+    el.notifBtnLabel.textContent = granted ? 'Notificações ativadas' : 'Ativar notificações';
+  }
 }
 
 async function activatePushNotifications(interactive) {
@@ -487,6 +587,7 @@ function initPWA() {
   });
 
   const triggerInstall = async () => {
+    closeHeaderMenu();
     if (state.deferredInstallPrompt) {
       await state.deferredInstallPrompt.prompt();
       const choice = await state.deferredInstallPrompt.userChoice;
@@ -504,11 +605,15 @@ function initPWA() {
   el.closeIosModalBtn.addEventListener('click', () => el.iosInstallModal.classList.add('hidden'));
 
   updateNotifButtonVisual();
-  el.notifBtn.addEventListener('click', () => activatePushNotifications(true));
+  el.notifBtn.addEventListener('click', () => {
+    closeHeaderMenu();
+    activatePushNotifications(true);
+  });
   el.chatAlertClose.addEventListener('click', hideChatAlert);
 }
 
-async function notifyBackground(title, body, tag) {
+async function notifyBackground(title, body, tag, allowDuringCall = false) {
+  if (!allowDuringCall && (state.inCall || state.incomingRinging)) return;
   if (document.visibilityState === 'visible') return;
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
 
@@ -566,7 +671,7 @@ async function manageWakeLock(acquire) {
 }
 
 // ============================================================================
-// TELA DE ACESSO (GABRIEL: 2010 / SAMELLA: 2011)
+// TELA DE ACESSO (SESSIONSTORAGE APENAS — PEDE SENHA AO FECHAR E ABRIR)
 // ============================================================================
 function initLockScreen() {
   if (!USERS[state.currentUser]) state.currentUser = 'Gabriel';
@@ -605,14 +710,17 @@ function initLockScreen() {
 
     el.lockError.classList.add('hidden');
     state.partnerName = getPartnerFor(state.currentUser);
-    localStorage.setItem('nm_last_user', state.currentUser);
+    state.unlocked = true;
     sessionStorage.setItem('nm_user', state.currentUser);
     sessionStorage.setItem('nm_unlocked', '1');
     el.passcodeInput.value = '';
     enterChat();
   });
 
-  el.lockAppBtn.addEventListener('click', lockApp);
+  el.lockAppBtn.addEventListener('click', () => {
+    closeHeaderMenu();
+    lockApp();
+  });
 
   if (state.unlocked && hasSupabaseCredentials() && USERS[state.currentUser]) {
     enterChat();
@@ -626,16 +734,100 @@ function showLockError(msg) {
 
 function lockApp() {
   updateMyDbStatus(false);
+  state.unlocked = false;
   sessionStorage.removeItem('nm_unlocked');
+  sessionStorage.removeItem('nm_user');
   cleanupRealtimeChannels();
   endCall(false);
   cancelAudioRecording();
+  closeLightbox();
+  closePhotoModal();
+  closeConfirmModal();
   el.chatScreen.classList.add('hidden');
   el.lockScreen.classList.remove('hidden');
 }
 
 // ============================================================================
-// CONEXÃO SUPABASE + REALTIME DUPLO + ONLINE/OFFLINE + VISTO
+// MENU 3 PONTINHOS (⋮) E LIMPEZA DE MENSAGENS
+// ============================================================================
+function closeHeaderMenu() {
+  el.headerMenuPopover.classList.add('hidden');
+  el.menuDotsBtn.setAttribute('aria-expanded', 'false');
+}
+
+function toggleHeaderMenu() {
+  const isOpen = !el.headerMenuPopover.classList.contains('hidden');
+  if (isOpen) {
+    closeHeaderMenu();
+  } else {
+    el.headerMenuPopover.classList.remove('hidden');
+    el.menuDotsBtn.setAttribute('aria-expanded', 'true');
+  }
+}
+
+function resetLocalChatDom(emptyLabel) {
+  el.messagesList.innerHTML = '';
+  el.callChatMessages.innerHTML = '';
+  state.renderedIds.clear();
+  state.callChatIds.clear();
+  state.messageCache.clear();
+  state.oldestTimestamp = null;
+  state.newestTimestamp = null;
+  state.hasMoreOlder = false;
+  el.loadOlderBtn.classList.add('hidden');
+  renderEmptyState(emptyLabel || `Envie a primeira mensagem para ${state.partnerName} ♡`);
+}
+
+async function executeClearChat() {
+  const nowIso = new Date().toISOString();
+  state.clearedAtIso = nowIso;
+  sessionStorage.setItem('nm_cleared_at', nowIso);
+
+  resetLocalChatDom('Mensagens limpas ♡');
+
+  if (state.chatChannel) {
+    state.chatChannel.send({
+      type: 'broadcast',
+      event: 'chat-cleared',
+      payload: { clearedAt: nowIso }
+    });
+  }
+
+  if (!state.supabase) return;
+
+  // Tenta limpar arquivos de mídia do Storage antes de apagar linhas no banco
+  try {
+    const { data: mediaRows } = await state.supabase
+      .from('messages')
+      .select('media_url')
+      .not('media_url', 'is', null)
+      .limit(200);
+    if (mediaRows && mediaRows.length > 0) {
+      const paths = mediaRows
+        .map((r) => extractStoragePathFromPublicUrl(r.media_url))
+        .filter(Boolean);
+      if (paths.length > 0) {
+        await state.supabase.storage.from('chat-media').remove(paths);
+      }
+    }
+  } catch (_) {}
+
+  // Tenta DELETE permanente; se RLS bloquear (SQL antigo), faz UPDATE marcando como apagado
+  const { error: delErr } = await state.supabase
+    .from('messages')
+    .delete()
+    .neq('id', '00000000-0000-0000-0000-000000000000');
+
+  if (delErr) {
+    await state.supabase
+      .from('messages')
+      .update({ content: MSG_DELETED_MARKER, media_url: null, is_read: true })
+      .neq('id', '00000000-0000-0000-0000-000000000000');
+  }
+}
+
+// ============================================================================
+// CONEXÃO SUPABASE + REALTIME DUPLO + PRESENÇA + WEBRTC DEDICADO
 // ============================================================================
 function enterChat() {
   if (!window.supabase || typeof window.supabase.createClient !== 'function') {
@@ -644,7 +836,7 @@ function enterChat() {
   }
 
   state.supabase = window.supabase.createClient(SUPABASE_URL.trim(), SUPABASE_ANON_KEY.trim(), {
-    realtime: { params: { eventsPerSecond: 15 } }
+    realtime: { params: { eventsPerSecond: 20 } }
   });
 
   state.partnerName = getPartnerFor(state.currentUser);
@@ -657,7 +849,7 @@ function enterChat() {
   el.chatScreen.classList.remove('hidden');
 
   updateNotifButtonVisual();
-  if (Notification && Notification.permission === 'granted') {
+  if ('Notification' in window && Notification.permission === 'granted') {
     activatePushNotifications(false);
   }
 
@@ -704,11 +896,10 @@ function renderPartnerStatus(isOnline, lastSeenIso) {
 
 function cleanupRealtimeChannels() {
   if (!state.supabase) return;
-  [state.chatChannel, state.signalChannel, state.callChannel, state.presenceChannel, state.statusChannel].forEach((ch) => {
+  [state.chatChannel, state.callChannel, state.presenceChannel, state.statusChannel].forEach((ch) => {
     if (ch) state.supabase.removeChannel(ch);
   });
   state.chatChannel = null;
-  state.signalChannel = null;
   state.callChannel = null;
   state.presenceChannel = null;
   state.statusChannel = null;
@@ -716,16 +907,39 @@ function cleanupRealtimeChannels() {
 
 function handleIncomingRealtimeMessage(msg) {
   if (!msg || !msg.id) return;
+  if (state.clearedAtIso && msg.created_at && msg.created_at <= state.clearedAtIso) return;
+  const photoMeta = parsePhotoMeta(msg);
+  if (photoMeta.deleted) return;
+
   const isNew = !state.renderedIds.has(msg.id);
   appendMessage(msg, true);
 
-  if (isNew && msg.sender_name !== state.currentUser) {
+  if (!isNew) return;
+
+  // Alimenta o chat invisível estilo Twitch quando em chamada
+  appendCallChatMessage(msg);
+
+  if (msg.sender_name !== state.currentUser) {
     state.partnerTyping = false;
     renderPartnerStatus(state.partnerOnlineRealtime, state.partnerLastSeen);
 
+    // Durante chamada/transmissão: ZERO toasts, ZERO som "plim", ZERO push notification!
+    // Apenas acende o ponto vermelho no botão de chat estilo Discord se o chat invisível estiver fechado.
+    if (state.inCall || state.incomingRinging) {
+      if (!state.callChatOpen) {
+        state.inCallUnreadCount += 1;
+        updateCallChatBadge();
+      } else {
+        markIncomingAsRead([msg.id]);
+      }
+      return;
+    }
+
     const preview =
       msg.media_type === 'image'
-        ? '📷 Enviou uma foto'
+        ? photoMeta.isDouble
+          ? '📷 Enviou uma foto 2x'
+          : '📷 Enviou uma foto'
         : msg.media_type === 'audio'
           ? '🎤 Enviou um áudio'
           : msg.content || 'Nova mensagem';
@@ -733,7 +947,7 @@ function handleIncomingRealtimeMessage(msg) {
     if (document.visibilityState === 'visible') {
       const viewport = el.messagesViewport;
       const nearBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 120;
-      if (nearBottom && !state.inCall) {
+      if (nearBottom) {
         playSoftTone(580, 760);
       } else {
         playMessagePlim();
@@ -746,10 +960,27 @@ function handleIncomingRealtimeMessage(msg) {
   }
 }
 
+function handleMessageDeletedOrUpdated(msg) {
+  if (!msg || !msg.id) return;
+  const meta = parsePhotoMeta(msg);
+  if (meta.deleted) {
+    removeMessageFromDom(msg.id);
+    return;
+  }
+  const cached = state.messageCache.get(msg.id);
+  const merged = cached ? { ...cached, ...msg } : msg;
+  state.messageCache.set(msg.id, merged);
+
+  updateMessageTicksInDom(merged);
+  if (merged.media_type === 'image') {
+    updatePhotoMessageInDom(merged);
+  }
+}
+
 function subscribeRealtime() {
   cleanupRealtimeChannels();
 
-  // 1. Canal do Chat: Postgres Changes + Broadcast instantâneo (~30ms)
+  // 1. Canal do Chat: Postgres Changes + Broadcast instantâneo
   state.chatChannel = state.supabase
     .channel('nosso-mundo-chat', {
       config: { broadcast: { self: false } }
@@ -765,7 +996,16 @@ function subscribeRealtime() {
       'postgres_changes',
       { event: 'UPDATE', schema: 'public', table: 'messages' },
       (payload) => {
-        if (payload && payload.new) updateMessageTicksInDom(payload.new);
+        if (payload && payload.new) handleMessageDeletedOrUpdated(payload.new);
+      }
+    )
+    .on(
+      'postgres_changes',
+      { event: 'DELETE', schema: 'public', table: 'messages' },
+      (payload) => {
+        if (payload && payload.old && payload.old.id) {
+          removeMessageFromDom(payload.old.id);
+        }
       }
     )
     .on('broadcast', { event: 'new-message' }, ({ payload }) => {
@@ -775,6 +1015,19 @@ function subscribeRealtime() {
       if (payload && Array.isArray(payload.ids)) {
         payload.ids.forEach((id) => updateMessageTicksInDom({ id, is_read: true }));
       }
+    })
+    .on('broadcast', { event: 'photo-view-updated' }, ({ payload }) => {
+      if (payload && payload.id) handleMessageDeletedOrUpdated(payload);
+    })
+    .on('broadcast', { event: 'message-deleted' }, ({ payload }) => {
+      if (payload && payload.id) removeMessageFromDom(payload.id);
+    })
+    .on('broadcast', { event: 'chat-cleared' }, ({ payload }) => {
+      if (payload && payload.clearedAt) {
+        state.clearedAtIso = payload.clearedAt;
+        sessionStorage.setItem('nm_cleared_at', payload.clearedAt);
+      }
+      resetLocalChatDom('Mensagens limpas ♡');
     })
     .on('broadcast', { event: 'typing' }, ({ payload }) => {
       if (!payload || payload.from === state.currentUser) return;
@@ -837,8 +1090,8 @@ function subscribeRealtime() {
     )
     .subscribe();
 
-  // 4. Sinalização WebRTC em canal dedicado e compartilhado
-  state.callChannel = state.supabase.channel('nosso-mundo-call', {
+  // 4. Canal Único de Sinalização WebRTC sempre ativo ('nosso-mundo-webrtc')
+  state.callChannel = state.supabase.channel('nosso-mundo-webrtc', {
     config: { broadcast: { self: false } }
   });
 
@@ -870,38 +1123,49 @@ function subscribeRealtime() {
     .on('broadcast', { event: 'ice-restart-answer' }, ({ payload }) => {
       handleIceRestartAnswer(payload);
     })
+    .on('broadcast', { event: 'video-mode-sync' }, ({ payload }) => {
+      handleRemoteVideoModeSync(payload);
+    })
     .on('broadcast', { event: 'video-off-notify' }, () => {
-      el.remoteVideo.classList.add('hidden');
-      el.voiceStageFallback.classList.remove('hidden');
+      state.remoteVideoMode = 'off';
+      updateRemoteStageVisibility();
     })
     .on('broadcast', { event: 'video-on-notify' }, () => {
       if (state.remoteStream && state.remoteStream.getVideoTracks().length > 0) {
         el.remoteVideo.srcObject = state.remoteStream;
-        el.remoteVideo.classList.remove('hidden');
-        el.voiceStageFallback.classList.add('hidden');
+        updateRemoteStageVisibility();
       }
     })
     .subscribe((status) => {
       if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-        showChatAlert('Reconectando canal de chamada...');
+        showChatAlert('Reconectando sinalização de chamada...');
       }
     });
 }
 
 // ============================================================================
-// CHAT: CARREGAMENTO, SYNC E VISTO DE WHATSAPP (✓ / ✓✓ / ✓✓ AZUL)
+// CHAT: CARREGAMENTO, SYNC, FOTOS NORMAL/2X/APAGAR E VISTO
 // ============================================================================
 async function loadInitialMessages() {
   el.messagesList.innerHTML = '';
+  el.callChatMessages.innerHTML = '';
   state.renderedIds.clear();
+  state.callChatIds.clear();
+  state.messageCache.clear();
   state.oldestTimestamp = null;
   state.newestTimestamp = null;
 
-  const { data, error } = await state.supabase
+  let query = state.supabase
     .from('messages')
     .select('id, sender_name, content, media_url, media_type, is_read, read_at, created_at')
     .order('created_at', { ascending: false })
     .limit(INITIAL_FETCH_LIMIT);
+
+  if (state.clearedAtIso) {
+    query = query.gt('created_at', state.clearedAtIso);
+  }
+
+  const { data, error } = await query;
 
   if (error) {
     if (error.code === '42501') {
@@ -911,7 +1175,9 @@ async function loadInitialMessages() {
     return;
   }
 
-  if (!data || data.length === 0) {
+  const visibleRows = (data || []).filter((m) => !parsePhotoMeta(m).deleted);
+
+  if (visibleRows.length === 0) {
     renderEmptyState(`Envie a primeira mensagem para ${state.partnerName} ♡`);
     el.loadOlderBtn.classList.add('hidden');
     return;
@@ -920,7 +1186,7 @@ async function loadInitialMessages() {
   state.hasMoreOlder = data.length === INITIAL_FETCH_LIMIT;
   el.loadOlderBtn.classList.toggle('hidden', !state.hasMoreOlder);
 
-  const ordered = data.slice().reverse();
+  const ordered = visibleRows.slice().reverse();
   state.oldestTimestamp = ordered[0].created_at;
   state.newestTimestamp = ordered[ordered.length - 1].created_at;
 
@@ -929,6 +1195,7 @@ async function loadInitialMessages() {
   ordered.forEach((msg) => {
     const node = buildMessageNode(msg);
     if (node) frag.appendChild(node);
+    appendCallChatMessage(msg);
     if (msg.sender_name !== state.currentUser && !msg.is_read) {
       unreadIds.push(msg.id);
     }
@@ -959,12 +1226,18 @@ async function loadOlderMessages() {
   el.loadOlderBtn.disabled = true;
   el.loadOlderBtn.textContent = 'Carregando...';
 
-  const { data, error } = await state.supabase
+  let query = state.supabase
     .from('messages')
     .select('id, sender_name, content, media_url, media_type, is_read, read_at, created_at')
     .lt('created_at', state.oldestTimestamp)
     .order('created_at', { ascending: false })
     .limit(INITIAL_FETCH_LIMIT);
+
+  if (state.clearedAtIso) {
+    query = query.gt('created_at', state.clearedAtIso);
+  }
+
+  const { data, error } = await query;
 
   el.loadOlderBtn.disabled = false;
   el.loadOlderBtn.textContent = 'Carregar mensagens anteriores';
@@ -977,8 +1250,11 @@ async function loadOlderMessages() {
   state.hasMoreOlder = data.length === INITIAL_FETCH_LIMIT;
   el.loadOlderBtn.classList.toggle('hidden', !state.hasMoreOlder);
 
+  const visibleRows = data.filter((m) => !parsePhotoMeta(m).deleted);
+  if (visibleRows.length === 0) return;
+
   const prevHeight = el.messagesViewport.scrollHeight;
-  const ordered = data.slice().reverse();
+  const ordered = visibleRows.slice().reverse();
   state.oldestTimestamp = ordered[0].created_at;
 
   const unreadIds = [];
@@ -1060,9 +1336,115 @@ function upgradePendingTicksToDelivered() {
   });
 }
 
+function removeMessageFromDom(msgId) {
+  state.renderedIds.delete(msgId);
+  state.messageCache.delete(msgId);
+  const row = el.messagesList.querySelector(`[data-id="${msgId}"]`);
+  if (row) row.remove();
+  if (state.activeLightboxMsg && state.activeLightboxMsg.id === msgId) {
+    state.activeLightboxMsg = null;
+    el.lightboxModal.classList.add('hidden');
+    el.lightboxImg.removeAttribute('src');
+  }
+  if (el.messagesList.children.length === 0) {
+    renderEmptyState(`Envie a primeira mensagem para ${state.partnerName} ♡`);
+  }
+}
+
+function renderPhotoContentIntoSlot(slot, msg) {
+  slot.innerHTML = '';
+  const meta = parsePhotoMeta(msg);
+  const isMe = msg.sender_name === state.currentUser;
+
+  if (meta.isDouble) {
+    const expired = meta.viewsLeft <= 0 || !msg.media_url;
+    const cardBtn = document.createElement('button');
+    cardBtn.type = 'button';
+    cardBtn.className = `photo-2x-card${expired ? ' expired' : ''}`;
+    cardBtn.disabled = expired;
+
+    const icon = document.createElement('span');
+    icon.className = 'photo-2x-icon';
+    icon.textContent = expired ? '0x' : `${meta.viewsLeft}x`;
+
+    const info = document.createElement('span');
+    info.className = 'photo-2x-info';
+
+    const title = document.createElement('span');
+    title.className = 'photo-2x-title';
+    title.textContent = expired
+      ? 'Foto expirada'
+      : isMe
+        ? 'Foto dupla (2x) enviada'
+        : 'Abrir foto (2x)';
+
+    const sub = document.createElement('span');
+    sub.className = 'photo-2x-sub';
+    if (expired) {
+      sub.textContent = 'Visualizada 2 vezes';
+    } else if (meta.viewsLeft === 2) {
+      sub.textContent = isMe ? '2 visualizações disponíveis' : 'Toque para ver (2 restantes)';
+    } else {
+      sub.textContent = 'Última visualização (1 restante)';
+    }
+
+    info.appendChild(title);
+    info.appendChild(sub);
+    cardBtn.appendChild(icon);
+    cardBtn.appendChild(info);
+
+    if (!expired) {
+      cardBtn.addEventListener('click', () => openLightbox(msg));
+    }
+    slot.appendChild(cardBtn);
+  } else if (msg.media_url) {
+    const img = document.createElement('img');
+    img.className = 'msg-image';
+    img.src = msg.media_url;
+    img.alt = 'Foto enviada';
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.addEventListener('click', () => openLightbox(msg));
+    slot.appendChild(img);
+  }
+
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'msg-photo-delete-btn';
+  delBtn.textContent = 'Apagar foto';
+  delBtn.addEventListener('click', () => {
+    openConfirmModal(
+      'Apagar foto?',
+      'Essa foto será removida da conversa para vocês dois.',
+      'Apagar',
+      () => deletePhotoMessage(msg)
+    );
+  });
+  slot.appendChild(delBtn);
+
+  if (meta.caption) {
+    const textEl = document.createElement('p');
+    textEl.className = 'msg-text';
+    textEl.textContent = meta.caption;
+    slot.appendChild(textEl);
+  }
+}
+
+function updatePhotoMessageInDom(msg) {
+  const row = el.messagesList.querySelector(`[data-id="${msg.id}"]`);
+  if (!row) return;
+  const slot = row.querySelector('.msg-photo-wrap');
+  if (!slot) return;
+  renderPhotoContentIntoSlot(slot, msg);
+}
+
 function buildMessageNode(msg) {
   if (!msg || !msg.id || state.renderedIds.has(msg.id)) return null;
+  const photoMeta = parsePhotoMeta(msg);
+  if (photoMeta.deleted) return null;
+
   state.renderedIds.add(msg.id);
+  state.messageCache.set(msg.id, msg);
 
   if (!state.newestTimestamp || msg.created_at > state.newestTimestamp) {
     state.newestTimestamp = msg.created_at;
@@ -1076,15 +1458,11 @@ function buildMessageNode(msg) {
   const bubble = document.createElement('div');
   bubble.className = 'msg-bubble';
 
-  if (msg.media_type === 'image' && msg.media_url) {
-    const img = document.createElement('img');
-    img.className = 'msg-image';
-    img.src = msg.media_url;
-    img.alt = 'Foto enviada';
-    img.loading = 'lazy';
-    img.decoding = 'async';
-    img.addEventListener('click', () => openLightbox(msg.media_url));
-    bubble.appendChild(img);
+  if (msg.media_type === 'image') {
+    const photoSlot = document.createElement('div');
+    photoSlot.className = 'msg-photo-wrap';
+    renderPhotoContentIntoSlot(photoSlot, msg);
+    bubble.appendChild(photoSlot);
   } else if (msg.media_type === 'audio' && msg.media_url) {
     const audio = document.createElement('audio');
     audio.className = 'msg-audio';
@@ -1098,9 +1476,13 @@ function buildMessageNode(msg) {
       state.activeAudio = audio;
     });
     bubble.appendChild(audio);
-  }
-
-  if (msg.content) {
+    if (msg.content) {
+      const textEl = document.createElement('p');
+      textEl.className = 'msg-text';
+      textEl.textContent = msg.content;
+      bubble.appendChild(textEl);
+    }
+  } else if (msg.content) {
     const textEl = document.createElement('p');
     textEl.className = 'msg-text';
     textEl.textContent = msg.content;
@@ -1143,7 +1525,10 @@ function appendMessage(msg, shouldAutoScroll) {
   while (el.messagesList.children.length > MAX_RENDERED_MESSAGES) {
     const first = el.messagesList.firstElementChild;
     if (!first) break;
-    if (first.dataset.id) state.renderedIds.delete(first.dataset.id);
+    if (first.dataset.id) {
+      state.renderedIds.delete(first.dataset.id);
+      state.messageCache.delete(first.dataset.id);
+    }
     first.remove();
   }
 
@@ -1168,13 +1553,9 @@ function broadcastMessage(msg) {
   });
 }
 
-async function sendTextMessage() {
-  const content = el.messageInput.value.trim();
-  if (!content || !state.supabase) return;
-
-  el.messageInput.value = '';
-  el.messageInput.style.height = 'auto';
-  toggleComposerButtons();
+async function sendTextContent(rawText) {
+  const content = (rawText || '').trim();
+  if (!content || !state.supabase) return false;
 
   const { data, error } = await state.supabase
     .from('messages')
@@ -1188,14 +1569,30 @@ async function sendTextMessage() {
     .single();
 
   if (error) {
-    showChatAlert('Não foi possível enviar. Confira sua internet ou o SQL no Supabase.');
-    return;
+    if (state.inCall) {
+      showCallToast('Erro ao enviar mensagem.');
+    } else {
+      showChatAlert('Não foi possível enviar. Confira sua internet ou o SQL no Supabase.');
+    }
+    return false;
   }
 
   if (data) {
     appendMessage(data, true);
+    appendCallChatMessage(data);
     broadcastMessage(data);
   }
+  return true;
+}
+
+async function sendTextMessage() {
+  const content = el.messageInput.value.trim();
+  if (!content || !state.supabase) return;
+
+  el.messageInput.value = '';
+  el.messageInput.style.height = 'auto';
+  toggleComposerButtons();
+  await sendTextContent(content);
 }
 
 function toggleComposerButtons() {
@@ -1205,7 +1602,68 @@ function toggleComposerButtons() {
 }
 
 // ============================================================================
-// FOTOS: COMPRESSÃO CLIENT-SIDE VIA CANVAS API + UPLOAD SUPABASE STORAGE
+// CHAT INVISÍVEL ESTILO TWITCH NA CHAMADA (SOMENTE TEXTO + PONTO VERMELHO)
+// ============================================================================
+function updateCallChatBadge() {
+  el.callChatBadge.classList.toggle('hidden', state.inCallUnreadCount === 0 || state.callChatOpen);
+}
+
+function appendCallChatMessage(msg) {
+  if (!msg || !msg.id || state.callChatIds.has(msg.id)) return;
+  const meta = parsePhotoMeta(msg);
+  if (meta.deleted) return;
+
+  let textPreview = '';
+  if (msg.media_type === 'text') {
+    textPreview = msg.content || '';
+  } else if (msg.media_type === 'image') {
+    textPreview = meta.isDouble ? '📷 Foto dupla (2x)' : '📷 Foto';
+  } else if (msg.media_type === 'audio') {
+    textPreview = '🎤 Áudio no chat';
+  }
+  if (!textPreview) return;
+
+  state.callChatIds.add(msg.id);
+  const line = document.createElement('div');
+  line.className = 'call-chat-line';
+
+  const author = document.createElement('span');
+  const isMe = msg.sender_name === state.currentUser;
+  author.className = `call-chat-author${isMe ? ' me' : ''}`;
+  author.textContent = `${msg.sender_name}:`;
+
+  const body = document.createElement('span');
+  body.textContent = textPreview;
+
+  line.appendChild(author);
+  line.appendChild(body);
+  el.callChatMessages.appendChild(line);
+
+  while (el.callChatMessages.children.length > MAX_CALL_CHAT_MESSAGES) {
+    el.callChatMessages.firstElementChild.remove();
+  }
+  el.callChatMessages.scrollTop = el.callChatMessages.scrollHeight;
+}
+
+function toggleCallChatOverlay() {
+  state.callChatOpen = !state.callChatOpen;
+  el.callChatOverlay.classList.toggle('hidden', !state.callChatOpen);
+  el.toggleCallChatBtn.classList.toggle('active-feature', state.callChatOpen);
+
+  if (state.callChatOpen) {
+    state.inCallUnreadCount = 0;
+    updateCallChatBadge();
+    el.callChatMessages.scrollTop = el.callChatMessages.scrollHeight;
+    clearTimeout(state.controlsAutoHideTimerId);
+    setControlsHidden(false);
+    markAllVisibleUnreadAsRead();
+  } else {
+    scheduleControlsAutoHide();
+  }
+}
+
+// ============================================================================
+// FOTOS: COMPRESSÃO CLIENT-SIDE VIA CANVAS + NORMAL / 2X / APAGAR
 // ============================================================================
 async function compressImageToJpeg(file) {
   let bitmap = null;
@@ -1262,11 +1720,21 @@ async function compressImageToJpeg(file) {
   }
 }
 
+function setPendingPhotoMode(mode) {
+  state.pendingPhotoMode = mode === 'double' ? 'double' : 'normal';
+  el.photoModeButtons.forEach((btn) => {
+    const active = btn.dataset.photoMode === state.pendingPhotoMode;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', String(active));
+  });
+}
+
 async function handlePhotoSelected(e) {
   const file = e.target.files && e.target.files[0];
   e.target.value = '';
   if (!file) return;
 
+  setPendingPhotoMode('normal');
   el.photoModal.classList.remove('hidden');
   el.confirmPhotoBtn.disabled = true;
   el.photoSizeBadge.textContent = 'Comprimindo...';
@@ -1297,6 +1765,7 @@ async function uploadAndSendPhoto() {
   if (!state.pendingPhotoBlob || !state.supabase) return;
   const blob = state.pendingPhotoBlob;
   const caption = el.photoCaptionInput.value.trim();
+  const isDouble = state.pendingPhotoMode === 'double';
 
   el.confirmPhotoBtn.disabled = true;
   el.confirmPhotoBtn.textContent = 'Enviando...';
@@ -1310,11 +1779,13 @@ async function uploadAndSendPhoto() {
     if (uploadErr) throw uploadErr;
 
     const { data: pub } = state.supabase.storage.from('chat-media').getPublicUrl(filePath);
+    const contentPayload = serializePhotoMeta(isDouble, 2, caption);
+
     const { data: inserted, error: msgErr } = await state.supabase
       .from('messages')
       .insert({
         sender_name: state.currentUser,
-        content: caption || null,
+        content: contentPayload,
         media_url: pub.publicUrl,
         media_type: 'image',
         is_read: false
@@ -1324,6 +1795,7 @@ async function uploadAndSendPhoto() {
 
     if (!msgErr && inserted) {
       appendMessage(inserted, true);
+      appendCallChatMessage(inserted);
       broadcastMessage(inserted);
     }
     closePhotoModal();
@@ -1335,18 +1807,119 @@ async function uploadAndSendPhoto() {
   }
 }
 
-function openLightbox(url) {
-  el.lightboxImg.src = url;
+function openLightbox(msgOrUrl) {
+  if (typeof msgOrUrl === 'string') {
+    state.activeLightboxMsg = null;
+    el.lightboxBadge.classList.add('hidden');
+    el.lightboxDeleteBtn.classList.add('hidden');
+    el.lightboxImg.src = msgOrUrl;
+    el.lightboxModal.classList.remove('hidden');
+    return;
+  }
+
+  const msg = state.messageCache.get(msgOrUrl.id) || msgOrUrl;
+  const meta = parsePhotoMeta(msg);
+  if (!msg.media_url || (meta.isDouble && meta.viewsLeft <= 0)) return;
+
+  state.activeLightboxMsg = msg;
+  el.lightboxImg.src = msg.media_url;
+  el.lightboxDeleteBtn.classList.remove('hidden');
+
+  if (meta.isDouble) {
+    const isMe = msg.sender_name === state.currentUser;
+    el.lightboxBadge.textContent = isMe
+      ? `Foto 2x (${meta.viewsLeft} restantes)`
+      : meta.viewsLeft === 2
+        ? 'Visualização 1 de 2'
+        : 'Última visualização (2 de 2)';
+    el.lightboxBadge.classList.remove('hidden');
+  } else {
+    el.lightboxBadge.classList.add('hidden');
+  }
+
   el.lightboxModal.classList.remove('hidden');
 }
 
-function closeLightbox() {
+async function closeLightbox() {
+  const viewedMsg = state.activeLightboxMsg;
+  state.activeLightboxMsg = null;
   el.lightboxModal.classList.add('hidden');
   el.lightboxImg.removeAttribute('src');
+  el.lightboxBadge.classList.add('hidden');
+  el.lightboxDeleteBtn.classList.add('hidden');
+
+  if (!viewedMsg || viewedMsg.sender_name === state.currentUser) return;
+
+  const currentMsg = state.messageCache.get(viewedMsg.id) || viewedMsg;
+  const meta = parsePhotoMeta(currentMsg);
+  if (!meta.isDouble || meta.viewsLeft <= 0) return;
+
+  const nextViews = Math.max(0, meta.viewsLeft - 1);
+  const nextContent = serializePhotoMeta(true, nextViews, meta.caption);
+  const nextMediaUrl = nextViews === 0 ? null : currentMsg.media_url;
+  const updatedMsg = {
+    ...currentMsg,
+    content: nextContent,
+    media_url: nextMediaUrl,
+    is_read: true
+  };
+
+  state.messageCache.set(currentMsg.id, updatedMsg);
+  updatePhotoMessageInDom(updatedMsg);
+
+  if (state.chatChannel) {
+    state.chatChannel.send({
+      type: 'broadcast',
+      event: 'photo-view-updated',
+      payload: updatedMsg
+    });
+  }
+
+  if (state.supabase) {
+    const updateData = {
+      content: nextContent,
+      is_read: true,
+      read_at: new Date().toISOString()
+    };
+    if (nextViews === 0) updateData.media_url = null;
+    await state.supabase.from('messages').update(updateData).eq('id', currentMsg.id);
+    if (nextViews === 0 && currentMsg.media_url) {
+      removeMediaFromStorage(currentMsg.media_url);
+    }
+  }
+}
+
+async function deletePhotoMessage(msg) {
+  if (!msg || !msg.id) return;
+  const mediaUrl = msg.media_url;
+  removeMessageFromDom(msg.id);
+
+  if (state.chatChannel) {
+    state.chatChannel.send({
+      type: 'broadcast',
+      event: 'message-deleted',
+      payload: { id: msg.id }
+    });
+  }
+
+  if (!state.supabase) return;
+
+  const { error: delErr } = await state.supabase.from('messages').delete().eq('id', msg.id);
+  if (delErr) {
+    // Fallback caso o usuário ainda não tenha reaplicado o GRANT DELETE no Supabase
+    await state.supabase
+      .from('messages')
+      .update({ content: MSG_DELETED_MARKER, media_url: null, is_read: true })
+      .eq('id', msg.id);
+  }
+
+  if (mediaUrl) {
+    removeMediaFromStorage(mediaUrl);
+  }
 }
 
 // ============================================================================
-// ÁUDIO: GRAVAÇÃO VIA MEDIARECORDER + LIBERAÇÃO IMEDIATA DE TRACKS
+// ÁUDIO: GRAVAÇÃO 128KBPS VIA MEDIARECORDER + LIBERAÇÃO IMEDIATA DE TRACKS
 // ============================================================================
 function pickAudioMimeType() {
   if (typeof MediaRecorder === 'undefined') return '';
@@ -1463,12 +2036,13 @@ async function uploadAndSendAudio(audioBlob, mimeType) {
 
   if (!msgErr && inserted) {
     appendMessage(inserted, true);
+    appendCallChatMessage(inserted);
     broadcastMessage(inserted);
   }
 }
 
 // ============================================================================
-// WEBRTC ESTILO DISCORD: VOZ + VÍDEO 720p@30fps + TRANSMISSÃO + VIRAR CÂMERA
+// WEBRTC ESTILO WHATSAPP/DISCORD: VOZ 48KHZ + TELA 720P + ISOLAMENTO DE ÁUDIO
 // ============================================================================
 function getVideoConstraints(ecoMode, facingMode, exactFacing) {
   const facing = exactFacing ? { exact: facingMode } : facingMode;
@@ -1489,14 +2063,27 @@ function getVideoConstraints(ecoMode, facingMode, exactFacing) {
 }
 
 async function acquireAudioStream() {
-  return navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true
-    },
-    video: false
-  });
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 48000,
+        channelCount: 1
+      },
+      video: false
+    });
+  } catch (_) {
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      },
+      video: false
+    });
+  }
 }
 
 async function acquireCameraStream(ecoMode, facingMode, exactFirst = false) {
@@ -1512,7 +2099,6 @@ async function acquireCameraStream(ecoMode, facingMode, exactFirst = false) {
     } catch (_) {}
   }
 
-  // Fallback por deviceId caso o aparelho Android ignore facingMode
   const devices = await navigator.mediaDevices.enumerateDevices();
   const videoInputs = devices.filter((d) => d.kind === 'videoinput');
   if (videoInputs.length > 0) {
@@ -1562,13 +2148,29 @@ function sendSignal(event, data) {
   });
 }
 
+function unlockRemoteAudioPlayback() {
+  el.remoteAudio.muted = state.soundMuted;
+  el.remoteAudio.volume = state.soundMuted ? 0 : 1.0;
+  el.remoteAudio.play().catch(() => {});
+  el.remoteVideo.muted = true;
+}
+
 function updateRemoteStageVisibility() {
   const hasActiveRemoteVideo =
     state.remoteStream &&
     state.remoteStream.getVideoTracks().some((t) => t.readyState === 'live' && !t.muted);
 
   el.remoteVideo.classList.toggle('hidden', !hasActiveRemoteVideo);
+  el.remoteVideo.classList.toggle('is-screen', state.remoteVideoMode === 'screen');
   el.voiceStageFallback.classList.toggle('hidden', hasActiveRemoteVideo);
+  applyStageRotationVisual();
+}
+
+function handleRemoteVideoModeSync(payload) {
+  const mode = payload && payload.data && payload.data.mode;
+  if (!mode) return;
+  state.remoteVideoMode = mode;
+  updateRemoteStageVisibility();
 }
 
 function preferVideoCodecs(pc) {
@@ -1585,7 +2187,9 @@ function preferVideoCodecs(pc) {
         (trans.sender && trans.sender.track && trans.sender.track.kind === 'video') ||
         (trans.receiver && trans.receiver.track && trans.receiver.track.kind === 'video');
       if (isVideo) {
-        try { trans.setCodecPreferences(preferred); } catch (_) {}
+        try {
+          trans.setCodecPreferences(preferred);
+        } catch (_) {}
       }
     }
   } catch (_) {}
@@ -1606,6 +2210,7 @@ function createPeerConnection() {
       state.remoteStream.addTrack(event.track);
     }
 
+    // Todo áudio remoto sai exclusivamente por #remote-audio (evita eco/duplo áudio no Android)
     if (event.track.kind === 'audio') {
       const audioOnlyStream = new MediaStream([event.track]);
       el.remoteAudio.srcObject = audioOnlyStream;
@@ -1614,10 +2219,10 @@ function createPeerConnection() {
       el.remoteAudio.play().catch(() => {});
     }
 
+    // Vídeo remoto permanece sempre mudo (#remote-video muted)
     if (event.track.kind === 'video') {
       el.remoteVideo.srcObject = state.remoteStream;
-      el.remoteVideo.muted = state.soundMuted;
-      el.remoteVideo.volume = state.soundMuted ? 0 : 1.0;
+      el.remoteVideo.muted = true;
       el.remoteVideo.play().catch(() => {});
       event.track.onmute = updateRemoteStageVisibility;
       event.track.onunmute = updateRemoteStageVisibility;
@@ -1642,11 +2247,12 @@ function createPeerConnection() {
       state.iceRestartTimerId = setTimeout(async () => {
         if (!state.pc || state.pc.connectionState !== 'disconnected') return;
         try {
+          if (typeof state.pc.restartIce === 'function') state.pc.restartIce();
           const restartOffer = await state.pc.createOffer({ iceRestart: true });
           await state.pc.setLocalDescription(restartOffer);
           sendSignal('ice-restart-offer', restartOffer);
         } catch (_) {}
-      }, 3000);
+      }, 2500);
     }
   };
 
@@ -1664,11 +2270,18 @@ async function startOutgoingCall(withVideo) {
     state.soundMuted = false;
     state.facingMode = 'user';
     state.videoMode = withVideo ? 'camera' : 'off';
+    state.remoteVideoMode = 'off';
+    state.pipSwapped = false;
+    state.callChatOpen = false;
+    state.inCallUnreadCount = 0;
 
-    el.videoOverlay.classList.remove('hidden');
+    unlockRemoteAudioPlayback();
+    el.videoOverlay.classList.remove('hidden', 'pip-swapped', 'controls-hidden');
+    el.callChatOverlay.classList.add('hidden');
     el.activeCallBanner.classList.add('hidden');
     el.callPartnerLabel.textContent = state.partnerName;
     el.callStateLabel.textContent = withVideo ? 'Iniciando câmera 720p...' : 'Iniciando áudio...';
+    updateCallChatBadge();
 
     state.localAudioStream = await acquireAudioStream();
     state.pc = createPeerConnection();
@@ -1686,13 +2299,21 @@ async function startOutgoingCall(withVideo) {
     }
 
     updateCallUIState();
+    setControlsHidden(false);
+    scheduleControlsAutoHide();
 
     preferVideoCodecs(state.pc);
     const offer = await state.pc.createOffer();
     await state.pc.setLocalDescription(offer);
 
     el.callStateLabel.textContent = 'Chamando...';
-    sendSignal('incoming-call', { sdp: offer, withVideo, caller: state.currentUser });
+    sendSignal('incoming-call', {
+      caller: state.currentUser,
+      callType: withVideo ? 'video' : 'audio',
+      withVideo,
+      offer,
+      sdp: offer
+    });
 
     clearTimeout(state.ringTimeoutId);
     state.ringTimeoutId = setTimeout(() => {
@@ -1702,6 +2323,7 @@ async function startOutgoingCall(withVideo) {
     }, 45000);
   } catch (_) {
     endCall(false);
+    showChatAlert('Erro ao acessar microfone ou câmera para a chamada.');
   }
 }
 
@@ -1709,21 +2331,31 @@ async function acceptIncomingCall() {
   if (!state.pendingOffer) return;
 
   stopRingtone();
+  state.incomingRinging = false;
   el.incomingModal.classList.remove('incoming-backdrop');
   el.incomingModal.classList.add('hidden');
   el.incomingModal.style.cssText = '';
+
   state.inCall = true;
   state.callMinimized = false;
   state.micMuted = false;
   state.soundMuted = false;
   state.facingMode = 'user';
   state.videoMode = state.pendingCallWithVideo ? 'camera' : 'off';
+  state.remoteVideoMode = state.pendingCallWithVideo ? 'camera' : 'off';
+  state.pipSwapped = false;
+  state.callChatOpen = false;
+  state.inCallUnreadCount = 0;
+
+  unlockRemoteAudioPlayback();
 
   try {
-    el.videoOverlay.classList.remove('hidden');
+    el.videoOverlay.classList.remove('hidden', 'pip-swapped', 'controls-hidden');
+    el.callChatOverlay.classList.add('hidden');
     el.activeCallBanner.classList.add('hidden');
     el.callPartnerLabel.textContent = state.pendingCallerName || state.partnerName;
     el.callStateLabel.textContent = 'Conectando...';
+    updateCallChatBadge();
 
     state.localAudioStream = await acquireAudioStream();
     state.pc = createPeerConnection();
@@ -1740,6 +2372,8 @@ async function acceptIncomingCall() {
     }
 
     updateCallUIState();
+    setControlsHidden(false);
+    scheduleControlsAutoHide();
 
     await state.pc.setRemoteDescription(new RTCSessionDescription(state.pendingOffer));
     state.pendingOffer = null;
@@ -1757,7 +2391,8 @@ async function acceptIncomingCall() {
     await applyVideoBitrateLimits(state.pc, state.ecoMode480p);
 
     forcePlayRemoteMedia();
-    sendSignal('call-accepted', answer);
+    sendSignal('call-accepted', { caller: state.currentUser, answer });
+    sendSignal('video-mode-sync', { mode: state.videoMode });
   } catch (_) {
     endCall(true);
   }
@@ -1765,6 +2400,7 @@ async function acceptIncomingCall() {
 
 function rejectIncomingCall() {
   stopRingtone();
+  state.incomingRinging = false;
   el.incomingModal.classList.remove('incoming-backdrop');
   el.incomingModal.classList.add('hidden');
   el.incomingModal.style.cssText = '';
@@ -1785,15 +2421,19 @@ async function renegotiateCall() {
 }
 
 function handleIncomingCall(payload) {
-  if (!payload || !payload.data || !payload.data.sdp) return;
+  const data = payload && payload.data;
+  const offerSdp = data && (data.offer || data.sdp);
+  if (!offerSdp) return;
+
   if (state.inCall) {
     sendSignal('call-rejected');
     return;
   }
-  const data = payload.data;
-  state.pendingOffer = data.sdp;
-  state.pendingCallWithVideo = Boolean(data.withVideo);
-  state.pendingCallerName = payload.from || state.partnerName;
+
+  state.incomingRinging = true;
+  state.pendingOffer = offerSdp;
+  state.pendingCallWithVideo = data.callType === 'video' || Boolean(data.withVideo);
+  state.pendingCallerName = (data && data.caller) || payload.from || state.partnerName;
   state.pendingIceCandidates = [];
 
   el.incomingCallerName.textContent = `${state.pendingCallerName} está ligando ♡`;
@@ -1801,7 +2441,7 @@ function handleIncomingCall(payload) {
     ? 'Ligação com vídeo e transmissão'
     : 'Ligação de voz (estilo Discord)';
 
-  // Força a exibição imediata do modal no destinatário (Galaxy J5)
+  // Força exibição imediata no destinatário (Galaxy J5)
   el.incomingModal.classList.remove('hidden');
   el.incomingModal.classList.add('incoming-backdrop');
   el.incomingModal.style.setProperty('display', 'flex', 'important');
@@ -1811,33 +2451,37 @@ function handleIncomingCall(payload) {
   notifyBackground(
     `${state.pendingCallerName} está ligando ♡`,
     state.pendingCallWithVideo ? 'Toque para atender o vídeo' : 'Toque para atender a voz',
-    'call-nosso-mundo'
+    'call-nosso-mundo',
+    true
   );
 
   if (navigator.vibrate) {
     try {
-      navigator.vibrate([300, 200, 300, 200, 300, 200, 300]);
+      navigator.vibrate([400, 200, 400]);
     } catch (_) {}
   }
 }
 
 async function handleCallAccepted(payload) {
   if (!payload || !payload.data || !state.pc) return;
+  const answerSdp = payload.data.answer || payload.data;
   clearTimeout(state.ringTimeoutId);
   stopRingtone();
   try {
-    await state.pc.setRemoteDescription(new RTCSessionDescription(payload.data));
+    await state.pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
     while (state.pendingIceCandidates.length > 0) {
       const cand = state.pendingIceCandidates.shift();
       try {
         await state.pc.addIceCandidate(new RTCIceCandidate(cand));
       } catch (_) {}
     }
+    sendSignal('video-mode-sync', { mode: state.videoMode });
   } catch (_) {}
 }
 
 function handleCallRejectedOrEnded() {
   stopRingtone();
+  state.incomingRinging = false;
   el.incomingModal.classList.remove('incoming-backdrop');
   el.incomingModal.classList.add('hidden');
   el.incomingModal.style.cssText = '';
@@ -1895,6 +2539,116 @@ async function handleIceRestartAnswer(payload) {
   } catch (_) {}
 }
 
+// ============================================================================
+// MIXER DE ÁUDIO DA TRANSMISSÃO (MIC MUTADO NÃO CORTA ÁUDIO DO FILME!)
+// ============================================================================
+async function setupScreenAudioMix(screenAudioTrack) {
+  teardownScreenAudioMix(false);
+  if (!screenAudioTrack || !state.localAudioStream || !state.pc) return;
+
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    let mixCtx;
+    try {
+      mixCtx = new Ctx({ sampleRate: 48000 });
+    } catch (_) {
+      mixCtx = new Ctx();
+    }
+    if (mixCtx.state === 'suspended') await mixCtx.resume();
+
+    const dest = mixCtx.createMediaStreamDestination();
+    const micGain = mixCtx.createGain();
+    const screenGain = mixCtx.createGain();
+
+    micGain.gain.value = state.micMuted ? 0 : 1;
+    screenGain.gain.value = 1;
+
+    const screenSource = mixCtx.createMediaStreamSource(new MediaStream([screenAudioTrack]));
+    const micSource = mixCtx.createMediaStreamSource(state.localAudioStream);
+
+    screenSource.connect(screenGain).connect(dest);
+    micSource.connect(micGain).connect(dest);
+
+    const mixedTrack = dest.stream.getAudioTracks()[0];
+    const audioSender = state.pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
+    if (audioSender && mixedTrack) {
+      state.screenMixCtx = mixCtx;
+      state.screenMixMicGain = micGain;
+      state.screenMixScreenGain = screenGain;
+      state.screenAudioTrack = screenAudioTrack;
+      await audioSender.replaceTrack(mixedTrack);
+    } else {
+      mixCtx.close();
+    }
+  } catch (_) {}
+}
+
+function teardownScreenAudioMix(restoreMicTrack = true) {
+  if (state.screenAudioTrack) {
+    try {
+      state.screenAudioTrack.stop();
+    } catch (_) {}
+    state.screenAudioTrack = null;
+  }
+  if (state.screenMixCtx) {
+    try {
+      state.screenMixCtx.close();
+    } catch (_) {}
+    state.screenMixCtx = null;
+  }
+  state.screenMixMicGain = null;
+  state.screenMixScreenGain = null;
+
+  if (restoreMicTrack && state.pc && state.localAudioStream) {
+    const micTrack = state.localAudioStream.getAudioTracks()[0];
+    const audioSender = state.pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
+    if (audioSender && micTrack) {
+      micTrack.enabled = !state.micMuted;
+      audioSender.replaceTrack(micTrack).catch(() => {});
+    }
+  }
+}
+
+async function acquireScreenShareStream() {
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+    throw new Error('UNSUPPORTED');
+  }
+
+  // 1. Tentativa ideal 720p@30fps + áudio bruto do filme (sem supressão de voz)
+  try {
+    return await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        width: { ideal: 1280, max: 1280 },
+        height: { ideal: 720, max: 720 },
+        frameRate: { ideal: 30, max: 30 }
+      },
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+  } catch (err) {
+    if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) throw err;
+  }
+
+  // 2. Fallback flexível mantendo áudio do sistema
+  try {
+    return await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true
+    });
+  } catch (err) {
+    if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) throw err;
+  }
+
+  // 3. Último fallback apenas vídeo caso o dispositivo bloqueie captura de áudio interno
+  const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+  showCallToast('Tela transmitida (este aparelho não liberou áudio interno do sistema).');
+  return stream;
+}
+
 async function attachOrReplaceVideoStream(newStream, nextMode) {
   const newTrack = newStream.getVideoTracks()[0];
   if (!newTrack) return;
@@ -1913,21 +2667,26 @@ async function attachOrReplaceVideoStream(newStream, nextMode) {
   }
 
   state.videoMode = nextMode;
+  sendSignal('video-mode-sync', { mode: nextMode });
   updateCallUIState();
 }
 
 async function toggleLocalVideoMode(targetMode) {
   if (!state.inCall || !state.pc) return;
+  resetControlsAutoHideOnInteraction();
 
   if (state.videoMode === targetMode) {
+    teardownScreenAudioMix(true);
     stopLocalVideoTrack();
     state.videoMode = 'off';
-    updateCallUIState();
+    sendSignal('video-mode-sync', { mode: 'off' });
     sendSignal('video-off-notify');
+    updateCallUIState();
     return;
   }
 
-  // Libera câmera/vídeo anterior ANTES de abrir nova fonte (crucial no hardware Android J5)
+  // Libera vídeo anterior ANTES de abrir nova fonte (crucial no hardware Android J5)
+  teardownScreenAudioMix(true);
   stopStreamTracks(state.localVideoStream);
   state.localVideoStream = null;
   el.localVideo.srcObject = null;
@@ -1940,68 +2699,52 @@ async function toggleLocalVideoMode(targetMode) {
     }
 
     if (targetMode === 'screen') {
-      const canDisplay =
-        navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function';
+      const screenStream = await acquireScreenShareStream();
+      const screenTrack = screenStream.getVideoTracks()[0];
+      const screenAudioTrack = screenStream.getAudioTracks()[0];
 
-      if (canDisplay) {
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({
-          video: { width: { max: 1280 }, height: { max: 720 }, frameRate: { max: 30 } },
-          audio: true
-        });
-        const screenTrack = screenStream.getVideoTracks()[0];
-        const screenAudioTrack = screenStream.getAudioTracks()[0];
-
-        // Mistura áudio da tela com o microfone (voz continua ativa, sem cortes)
-        if (screenAudioTrack && state.localAudioStream && state.pc) {
-          try {
-            const Ctx = window.AudioContext || window.webkitAudioContext;
-            const mixCtx = new Ctx();
-            const dest = mixCtx.createMediaStreamDestination();
-            mixCtx.createMediaStreamSource(new MediaStream([screenAudioTrack])).connect(dest);
-            mixCtx.createMediaStreamSource(state.localAudioStream).connect(dest);
-            const mixedTrack = dest.stream.getAudioTracks()[0];
-            const audioSender = state.pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
-            if (audioSender) {
-              state.screenMixCtx = mixCtx;
-              await audioSender.replaceTrack(mixedTrack);
-            } else {
-              mixCtx.close();
-            }
-          } catch (_) {}
-        }
-
-        if (screenTrack) {
-          screenTrack.onended = () => {
-            if (state.videoMode === 'screen') {
-              if (state.screenMixCtx) {
-                try { state.screenMixCtx.close(); } catch (_) {}
-                state.screenMixCtx = null;
-                const audioSender = state.pc && state.pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
-                if (audioSender && state.localAudioStream) {
-                  audioSender.replaceTrack(state.localAudioStream.getAudioTracks()[0]).catch(() => {});
-                }
-              }
-              stopLocalVideoTrack();
-              state.videoMode = 'off';
-              updateCallUIState();
-              sendSignal('video-off-notify');
-            }
-          };
-        }
-        await attachOrReplaceVideoStream(screenStream, 'screen');
-        return;
+      if (screenTrack && typeof screenTrack.applyConstraints === 'function') {
+        try {
+          await screenTrack.applyConstraints({
+            width: { max: 1280 },
+            height: { max: 720 },
+            frameRate: { max: 30 }
+          });
+        } catch (_) {}
       }
 
-      // Fallback no celular antigo (sem getDisplayMedia): inicia transmissão pela câmera traseira
-      state.facingMode = 'environment';
-      const rearStream = await acquireCameraStream(state.ecoMode480p, 'environment', true);
-      await attachOrReplaceVideoStream(rearStream, 'camera');
-      showCallToast('Captura de tela externa indisponível no Android antigo — transmitindo pela câmera traseira ♡');
+      if (screenAudioTrack) {
+        await setupScreenAudioMix(screenAudioTrack);
+      }
+
+      if (screenTrack) {
+        screenTrack.onended = () => {
+          if (state.videoMode === 'screen') {
+            teardownScreenAudioMix(true);
+            stopLocalVideoTrack();
+            state.videoMode = 'off';
+            sendSignal('video-mode-sync', { mode: 'off' });
+            sendSignal('video-off-notify');
+            updateCallUIState();
+          }
+        };
+      }
+
+      await attachOrReplaceVideoStream(screenStream, 'screen');
+      showCallToast('Transmissão de tela ativa em 720p ♡');
     }
-  } catch (_) {
+  } catch (err) {
+    teardownScreenAudioMix(true);
     state.videoMode = 'off';
+    sendSignal('video-mode-sync', { mode: 'off' });
     updateCallUIState();
-    showCallToast('Não foi possível iniciar a transmissão.');
+    if (err && err.message === 'UNSUPPORTED') {
+      showCallToast('Erro: este navegador não suporta transmissão de tela. Use o Google Chrome.');
+    } else if (err && err.name === 'NotAllowedError') {
+      showCallToast('Erro: permissão para transmitir tela foi cancelada.');
+    } else {
+      showCallToast('Erro: não foi possível iniciar a transmissão de tela.');
+    }
   }
 }
 
@@ -2021,8 +2764,8 @@ function stopLocalVideoTrack() {
 
 async function switchCamera() {
   if (!state.inCall || !state.pc) return;
+  resetControlsAutoHideOnInteraction();
 
-  // Se a câmera estava desligada, o botão de virar já liga a câmera
   const nextFacing =
     state.videoMode === 'camera'
       ? state.facingMode === 'user'
@@ -2031,6 +2774,7 @@ async function switchCamera() {
       : 'environment';
 
   // IMPORTANTE NO ANDROID (Galaxy J5): parar a câmera atual ANTES de abrir a outra!
+  teardownScreenAudioMix(true);
   stopStreamTracks(state.localVideoStream);
   state.localVideoStream = null;
   el.localVideo.srcObject = null;
@@ -2041,12 +2785,12 @@ async function switchCamera() {
     await attachOrReplaceVideoStream(newStream, 'camera');
     showCallToast(nextFacing === 'environment' ? 'Câmera traseira ativada' : 'Câmera frontal ativada');
   } catch (_) {
-    // Tenta recuperar a câmera anterior se a troca falhar
     try {
       const fallbackStream = await acquireCameraStream(state.ecoMode480p, state.facingMode, false);
       await attachOrReplaceVideoStream(fallbackStream, 'camera');
     } catch (_) {
       state.videoMode = 'off';
+      sendSignal('video-mode-sync', { mode: 'off' });
       updateCallUIState();
     }
     showCallToast('Não foi possível alternar a câmera neste aparelho.');
@@ -2054,6 +2798,7 @@ async function switchCamera() {
 }
 
 async function toggleEcoMode() {
+  resetControlsAutoHideOnInteraction();
   state.ecoMode480p = !state.ecoMode480p;
   el.ecoModeBtn.textContent = state.ecoMode480p ? '480p Eco' : '720p HD';
   el.ecoModeBtn.classList.toggle('eco-active', state.ecoMode480p);
@@ -2072,40 +2817,162 @@ async function toggleEcoMode() {
 
 function toggleMic() {
   if (!state.localAudioStream) return;
+  resetControlsAutoHideOnInteraction();
   state.micMuted = !state.micMuted;
-  state.localAudioStream.getAudioTracks().forEach((t) => {
-    t.enabled = !state.micMuted;
-  });
-  showCallToast(state.micMuted ? 'Microfone mutado' : 'Microfone ativo');
+
+  if (state.screenMixMicGain) {
+    // Quando transmitindo tela com áudio: zera APENAS o ganho do microfone,
+    // mantendo a faixa mista ativa e o áudio do filme 100% limpo!
+    state.screenMixMicGain.gain.value = state.micMuted ? 0 : 1;
+    state.localAudioStream.getAudioTracks().forEach((t) => {
+      t.enabled = true;
+    });
+    showCallToast(
+      state.micMuted
+        ? 'Seu mic está mutado (som da transmissão continua)'
+        : 'Seu mic está ativo junto com a transmissão'
+    );
+  } else {
+    state.localAudioStream.getAudioTracks().forEach((t) => {
+      t.enabled = !state.micMuted;
+    });
+    showCallToast(state.micMuted ? 'Microfone mutado' : 'Microfone ativo');
+  }
+
   updateCallUIState();
 }
 
 function toggleSound() {
+  resetControlsAutoHideOnInteraction();
   state.soundMuted = !state.soundMuted;
   el.remoteAudio.muted = state.soundMuted;
-  el.remoteVideo.muted = state.soundMuted;
+  el.remoteAudio.volume = state.soundMuted ? 0 : 1.0;
+  el.remoteVideo.muted = true;
   if (!state.soundMuted) {
-    el.remoteAudio.volume = 1.0;
-    el.remoteVideo.volume = 1.0;
     el.remoteAudio.play().catch(() => {});
-    el.remoteVideo.play().catch(() => {});
   }
-  showCallToast(state.soundMuted ? 'Áudio do parceiro silenciado' : 'Áudio do parceiro ativo');
+  showCallToast(state.soundMuted ? 'Retorno silenciado (transmissão segue normal)' : 'Áudio ativo');
   updateCallUIState();
 }
 
 function forcePlayRemoteMedia() {
   el.remoteAudio.muted = state.soundMuted;
-  el.remoteVideo.muted = state.soundMuted;
   el.remoteAudio.volume = state.soundMuted ? 0 : 1.0;
-  el.remoteVideo.volume = state.soundMuted ? 0 : 1.0;
+  el.remoteVideo.muted = true;
   el.remoteAudio.play().catch(() => {});
   el.remoteVideo.play().catch(() => {});
+}
+
+// ============================================================================
+// CONTROLES DE PALCO: PIP, ROTAÇÃO, TELA CHEIA E AUTO-OCULTAR (1 CLIQUE / 5S)
+// ============================================================================
+function applyStageRotationVisual() {
+  const isNativeLandscape = window.innerWidth > window.innerHeight;
+  const useCssRotation = state.isStageRotated && !isNativeLandscape && !state.pipSwapped;
+  el.remoteVideo.classList.toggle('stage-rotated', useCssRotation);
+  if (el.rotateStageBtn) {
+    el.rotateStageBtn.classList.toggle('active', state.isStageRotated);
+  }
+}
+
+async function toggleStageRotation() {
+  resetControlsAutoHideOnInteraction();
+  state.isStageRotated = !state.isStageRotated;
+
+  if (state.isStageRotated) {
+    if (screen.orientation && typeof screen.orientation.lock === 'function') {
+      try {
+        if (!document.fullscreenElement && !document.webkitFullscreenElement && el.videoOverlay.requestFullscreen) {
+          await el.videoOverlay.requestFullscreen().catch(() => {});
+        }
+        await screen.orientation.lock('landscape');
+      } catch (_) {}
+    }
+    showCallToast('Tela girada para paisagem');
+  } else {
+    if (screen.orientation && typeof screen.orientation.unlock === 'function') {
+      try {
+        screen.orientation.unlock();
+      } catch (_) {}
+    }
+    showCallToast('Tela em modo normal');
+  }
+
+  applyStageRotationVisual();
+}
+
+function swapPipVideos() {
+  if (!state.inCall) return;
+  state.pipSwapped = !state.pipSwapped;
+  el.videoOverlay.classList.toggle('pip-swapped', state.pipSwapped);
+  applyStageRotationVisual();
+  resetControlsAutoHideOnInteraction();
+}
+
+function setControlsHidden(hidden) {
+  state.controlsHidden = hidden;
+  el.videoOverlay.classList.toggle('controls-hidden', hidden);
+}
+
+function scheduleControlsAutoHide() {
+  clearTimeout(state.controlsAutoHideTimerId);
+  if (!state.inCall || state.callMinimized || state.callChatOpen) return;
+
+  state.controlsAutoHideTimerId = setTimeout(() => {
+    if (state.inCall && !state.callMinimized && !state.callChatOpen) {
+      setControlsHidden(true);
+    }
+  }, CONTROLS_AUTOHIDE_MS);
+}
+
+function resetControlsAutoHideOnInteraction() {
+  if (state.controlsHidden) setControlsHidden(false);
+  scheduleControlsAutoHide();
+}
+
+function toggleControlsVisibilityByTap() {
+  if (!state.inCall) return;
+  const nextHidden = !state.controlsHidden;
+  setControlsHidden(nextHidden);
+  if (!nextHidden) {
+    scheduleControlsAutoHide();
+  } else {
+    clearTimeout(state.controlsAutoHideTimerId);
+  }
+}
+
+async function toggleFullscreen() {
+  resetControlsAutoHideOnInteraction();
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  if (fsEl) {
+    try {
+      if (document.exitFullscreen) await document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    } catch (_) {}
+    el.videoOverlay.classList.remove('pseudo-fullscreen');
+    el.toggleFullscreenBtn.classList.remove('active-feature');
+    return;
+  }
+
+  try {
+    if (el.videoOverlay.requestFullscreen) {
+      await el.videoOverlay.requestFullscreen();
+    } else if (el.videoOverlay.webkitRequestFullscreen) {
+      el.videoOverlay.webkitRequestFullscreen();
+    } else {
+      el.videoOverlay.classList.toggle('pseudo-fullscreen');
+    }
+    el.toggleFullscreenBtn.classList.add('active-feature');
+  } catch (_) {
+    const active = el.videoOverlay.classList.toggle('pseudo-fullscreen');
+    el.toggleFullscreenBtn.classList.toggle('active-feature', active);
+  }
 }
 
 function minimizeCallToChat() {
   if (!state.inCall) return;
   state.callMinimized = true;
+  clearTimeout(state.controlsAutoHideTimerId);
   el.videoOverlay.classList.add('hidden');
   el.activeCallBanner.classList.remove('hidden');
 }
@@ -2115,6 +2982,8 @@ function restoreCallOverlay() {
   state.callMinimized = false;
   el.activeCallBanner.classList.add('hidden');
   el.videoOverlay.classList.remove('hidden');
+  setControlsHidden(false);
+  scheduleControlsAutoHide();
 }
 
 function updateCallUIState() {
@@ -2128,6 +2997,7 @@ function updateCallUIState() {
   el.toggleCamBtn.classList.toggle('active-feature', state.videoMode === 'camera');
   el.shareScreenBtn.classList.toggle('active-feature', state.videoMode === 'screen');
   manageWakeLock(hasLocalVideo);
+  updateRemoteStageVisibility();
 }
 
 function startCallTimer() {
@@ -2157,14 +3027,14 @@ function endCall(notifyPeer) {
   clearTimeout(state.ringTimeoutId);
   clearTimeout(state.callToastTimerId);
   clearTimeout(state.iceRestartTimerId);
+  clearTimeout(state.controlsAutoHideTimerId);
   clearInterval(state.callTimerId);
   stopRingtone();
-  if (state.screenMixCtx) {
-    try { state.screenMixCtx.close(); } catch (_) {}
-    state.screenMixCtx = null;
-  }
+  teardownScreenAudioMix(false);
+
   state.callTimerId = null;
   state.callSeconds = 0;
+  state.incomingRinging = false;
 
   if (notifyPeer && state.inCall) sendSignal('call-ended');
 
@@ -2189,20 +3059,48 @@ function endCall(notifyPeer) {
     state.pc = null;
   }
 
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  if (fsEl) {
+    try {
+      if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    } catch (_) {}
+  }
+
+  if (screen.orientation && typeof screen.orientation.unlock === 'function') {
+    try {
+      screen.orientation.unlock();
+    } catch (_) {}
+  }
+
   state.inCall = false;
   state.callMinimized = false;
   state.videoMode = 'off';
+  state.remoteVideoMode = 'off';
+  state.pipSwapped = false;
+  state.controlsHidden = false;
+  state.isStageRotated = false;
+  state.callChatOpen = false;
+  state.inCallUnreadCount = 0;
   state.pendingOffer = null;
   state.pendingIceCandidates = [];
 
   updateMediaSessionForCall(false);
   manageWakeLock(false);
+  updateCallChatBadge();
 
   el.callToast.classList.add('hidden');
+  el.callChatOverlay.classList.add('hidden');
+  el.remoteVideo.classList.remove('stage-rotated', 'is-screen');
+  if (el.rotateStageBtn) el.rotateStageBtn.classList.remove('active');
+  el.toggleCallChatBtn.classList.remove('active-feature');
+  el.toggleFullscreenBtn.classList.remove('active-feature');
+  el.videoOverlay.classList.remove('pip-swapped', 'controls-hidden', 'pseudo-fullscreen');
   el.videoOverlay.classList.add('hidden');
   el.activeCallBanner.classList.add('hidden');
   el.incomingModal.classList.remove('incoming-backdrop');
   el.incomingModal.classList.add('hidden');
+  el.incomingModal.style.cssText = '';
 }
 
 // ============================================================================
@@ -2211,6 +3109,41 @@ function endCall(notifyPeer) {
 function bindEvents() {
   el.loadOlderBtn.addEventListener('click', loadOlderMessages);
 
+  // Menu lateral 3 pontinhos (⋮)
+  el.menuDotsBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleHeaderMenu();
+  });
+  document.addEventListener('click', (e) => {
+    if (!el.headerMenuPopover.classList.contains('hidden')) {
+      if (!el.headerMenuPopover.contains(e.target) && !el.menuDotsBtn.contains(e.target)) {
+        closeHeaderMenu();
+      }
+    }
+  });
+
+  el.clearChatBtn.addEventListener('click', () => {
+    closeHeaderMenu();
+    openConfirmModal(
+      'Limpar mensagens?',
+      'Isso vai apagar as mensagens e mídias desta conversa.',
+      'Limpar tudo',
+      executeClearChat
+    );
+  });
+
+  // Modal de confirmação
+  el.confirmCancelBtn.addEventListener('click', closeConfirmModal);
+  el.confirmModal.addEventListener('click', (e) => {
+    if (e.target === el.confirmModal) closeConfirmModal();
+  });
+  el.confirmAcceptBtn.addEventListener('click', async () => {
+    const cb = state.confirmActionCallback;
+    closeConfirmModal();
+    if (typeof cb === 'function') await cb();
+  });
+
+  // Compositor de texto
   el.messageInput.addEventListener('input', () => {
     el.messageInput.style.height = 'auto';
     el.messageInput.style.height = `${Math.min(el.messageInput.scrollHeight, 112)}px`;
@@ -2236,12 +3169,26 @@ function bindEvents() {
 
   el.sendBtn.addEventListener('click', sendTextMessage);
 
-  // Fotos
+  // Fotos: Normal, Visualização Dupla (2x) e Apagar
   el.photoBtn.addEventListener('click', () => el.photoInput.click());
   el.photoInput.addEventListener('change', handlePhotoSelected);
+  el.photoModeButtons.forEach((btn) => {
+    btn.addEventListener('click', () => setPendingPhotoMode(btn.dataset.photoMode));
+  });
   el.cancelPhotoBtn.addEventListener('click', closePhotoModal);
   el.confirmPhotoBtn.addEventListener('click', uploadAndSendPhoto);
+
   el.closeLightboxBtn.addEventListener('click', closeLightbox);
+  el.lightboxDeleteBtn.addEventListener('click', () => {
+    const targetMsg = state.activeLightboxMsg;
+    if (!targetMsg) return;
+    openConfirmModal(
+      'Apagar foto?',
+      'Essa foto será removida da conversa para vocês dois.',
+      'Apagar',
+      () => deletePhotoMessage(targetMsg)
+    );
+  });
   el.lightboxModal.addEventListener('click', (e) => {
     if (e.target === el.lightboxModal) closeLightbox();
   });
@@ -2251,7 +3198,7 @@ function bindEvents() {
   el.cancelRecordBtn.addEventListener('click', cancelAudioRecording);
   el.sendRecordBtn.addEventListener('click', finishAudioRecording);
 
-  // Ligação / Transmissão estilo Discord
+  // Ligação / Transmissão / Twitch Chat / Tela Cheia
   el.startVoiceBtn.addEventListener('click', () => startOutgoingCall(false));
   el.startVideoBtn.addEventListener('click', () => startOutgoingCall(true));
   el.acceptCallBtn.addEventListener('click', acceptIncomingCall);
@@ -2265,8 +3212,53 @@ function bindEvents() {
   el.toggleCamBtn.addEventListener('click', () => toggleLocalVideoMode('camera'));
   el.shareScreenBtn.addEventListener('click', () => toggleLocalVideoMode('screen'));
   el.switchCamBtn.addEventListener('click', switchCamera);
+  if (el.rotateStageBtn) el.rotateStageBtn.addEventListener('click', toggleStageRotation);
   el.ecoModeBtn.addEventListener('click', toggleEcoMode);
+  el.toggleCallChatBtn.addEventListener('click', toggleCallChatOverlay);
+  el.toggleFullscreenBtn.addEventListener('click', toggleFullscreen);
   el.hangupBtn.addEventListener('click', () => endCall(true));
+
+  el.callChatForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const txt = el.callChatInput.value.trim();
+    if (!txt) return;
+    el.callChatInput.value = '';
+    await sendTextContent(txt);
+  });
+
+  // Toque no PiP alterna câmeras; toque em qualquer área livre oculta/exibe barras com 1 clique
+  el.localVideo.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (!state.pipSwapped) {
+      swapPipVideos();
+    } else {
+      toggleControlsVisibilityByTap();
+    }
+  });
+
+  el.remoteVideo.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (state.pipSwapped) {
+      swapPipVideos();
+    } else {
+      toggleControlsVisibilityByTap();
+    }
+  });
+
+  el.videoOverlay.addEventListener('click', (e) => {
+    if (e.target.closest('.call-top-bar, .call-controls, .call-chat-overlay, #call-toast, button, input, form')) {
+      return;
+    }
+    toggleControlsVisibilityByTap();
+  });
+
+  window.addEventListener('resize', applyStageRotationVisual);
+  window.addEventListener('orientationchange', applyStageRotationVisual);
+
+  document.addEventListener('fullscreenchange', () => {
+    const active = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+    el.toggleFullscreenBtn.classList.toggle('active-feature', active);
+  });
 
   // Sincroniza mensagens perdidas e marca como lidas ao voltar ao app
   document.addEventListener('visibilitychange', () => {
@@ -2274,7 +3266,7 @@ function bindEvents() {
     if (document.visibilityState === 'visible') {
       updateMyDbStatus(true);
       syncMissedMessages();
-      markAllVisibleUnreadAsRead();
+      if (!state.inCall || state.callChatOpen) markAllVisibleUnreadAsRead();
       if (state.inCall && state.videoMode !== 'off') manageWakeLock(true);
     } else {
       updateMyDbStatus(false);

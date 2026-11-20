@@ -3,7 +3,7 @@
 -- Execute este script no SQL Editor do seu projeto Supabase (uma única vez).
 -- ============================================================================
 
--- 1. TABELA DE MENSAGENS (COM VISTO / CONFIRMAÇÃO DE LEITURA DO WHATSAPP)
+-- 1. TABELA DE MENSAGENS (TEXTO, FOTOS NORMAIS/2X, ÁUDIO E VISTO)
 create table if not exists public.messages (
   id uuid primary key default gen_random_uuid(),
   sender_name text not null,
@@ -43,7 +43,7 @@ create table if not exists public.push_subscriptions (
 
 -- 4. CONCEDER PERMISSÕES BASE E HABILITAR RLS
 grant usage on schema public to anon, authenticated;
-grant select, insert, update on public.messages to anon, authenticated;
+grant select, insert, update, delete on public.messages to anon, authenticated;
 grant select, insert, update on public.user_status to anon, authenticated;
 grant select, insert, update on public.push_subscriptions to anon, authenticated;
 
@@ -75,7 +75,14 @@ create policy "Permitir marcar mensagens como lidas"
   for update
   to anon, authenticated
   using (true)
-  with check (is_read = true);
+  with check (true);
+
+drop policy if exists "Permitir apagar mensagens e fotos" on public.messages;
+create policy "Permitir apagar mensagens e fotos"
+  on public.messages
+  for delete
+  to anon, authenticated
+  using (true);
 
 alter table public.user_status enable row level security;
 
@@ -154,3 +161,10 @@ create policy "Upload rapido de midias chat-media"
   for insert
   to anon, authenticated
   with check (bucket_id = 'chat-media');
+
+drop policy if exists "Exclusao de midias chat-media" on storage.objects;
+create policy "Exclusao de midias chat-media"
+  on storage.objects
+  for delete
+  to anon, authenticated
+  using (bucket_id = 'chat-media');

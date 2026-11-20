@@ -7,8 +7,8 @@
    - Suporte completo a eventos Push e clique em notificações
    ============================================================================ */
 
-const CACHE_SHELL = 'nosso-mundo-shell-v3';
-const CACHE_STATIC = 'nosso-mundo-static-v3';
+const CACHE_SHELL = 'nosso-mundo-shell-v5';
+const CACHE_STATIC = 'nosso-mundo-static-v5';
 
 const PRECACHE_SHELL = ['/', '/index.html', '/style.css', '/app.js'];
 const PRECACHE_STATIC = [
