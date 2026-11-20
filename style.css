@@ -767,7 +767,7 @@ button {
 
 /* CHAMADA RECEBIDA — sempre por cima de tudo */
 .modal-backdrop.incoming-backdrop {
-  z-index: 9999;
+  z-index: 99999;
 }
 
 .incoming-card {

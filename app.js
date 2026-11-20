@@ -47,6 +47,7 @@ const state = {
   supabase: null,
   chatChannel: null,
   signalChannel: null,
+  callChannel: null,
   presenceChannel: null,
   statusChannel: null,
 
@@ -703,11 +704,12 @@ function renderPartnerStatus(isOnline, lastSeenIso) {
 
 function cleanupRealtimeChannels() {
   if (!state.supabase) return;
-  [state.chatChannel, state.signalChannel, state.presenceChannel, state.statusChannel].forEach((ch) => {
+  [state.chatChannel, state.signalChannel, state.callChannel, state.presenceChannel, state.statusChannel].forEach((ch) => {
     if (ch) state.supabase.removeChannel(ch);
   });
   state.chatChannel = null;
   state.signalChannel = null;
+  state.callChannel = null;
   state.presenceChannel = null;
   state.statusChannel = null;
 }
@@ -835,16 +837,55 @@ function subscribeRealtime() {
     )
     .subscribe();
 
-  // 4. Sinalização WebRTC em baixa latência
-  state.signalChannel = state.supabase.channel('nosso-mundo-webrtc', {
+  // 4. Sinalização WebRTC em canal dedicado e compartilhado
+  state.callChannel = state.supabase.channel('nosso-mundo-call', {
     config: { broadcast: { self: false } }
   });
 
-  state.signalChannel
-    .on('broadcast', { event: 'webrtc-signal' }, ({ payload }) => {
-      if (payload) handleWebRTCSignal(payload);
+  state.callChannel
+    .on('broadcast', { event: 'incoming-call' }, ({ payload }) => {
+      handleIncomingCall(payload);
     })
-    .subscribe();
+    .on('broadcast', { event: 'call-accepted' }, ({ payload }) => {
+      handleCallAccepted(payload);
+    })
+    .on('broadcast', { event: 'call-rejected' }, () => {
+      handleCallRejectedOrEnded();
+    })
+    .on('broadcast', { event: 'call-ended' }, () => {
+      handleCallRejectedOrEnded();
+    })
+    .on('broadcast', { event: 'ice-candidate' }, ({ payload }) => {
+      handleIncomingIceCandidate(payload);
+    })
+    .on('broadcast', { event: 'renegotiate-offer' }, ({ payload }) => {
+      handleRenegotiateOffer(payload);
+    })
+    .on('broadcast', { event: 'renegotiate-answer' }, ({ payload }) => {
+      handleRenegotiateAnswer(payload);
+    })
+    .on('broadcast', { event: 'ice-restart-offer' }, ({ payload }) => {
+      handleIceRestartOffer(payload);
+    })
+    .on('broadcast', { event: 'ice-restart-answer' }, ({ payload }) => {
+      handleIceRestartAnswer(payload);
+    })
+    .on('broadcast', { event: 'video-off-notify' }, () => {
+      el.remoteVideo.classList.add('hidden');
+      el.voiceStageFallback.classList.remove('hidden');
+    })
+    .on('broadcast', { event: 'video-on-notify' }, () => {
+      if (state.remoteStream && state.remoteStream.getVideoTracks().length > 0) {
+        el.remoteVideo.srcObject = state.remoteStream;
+        el.remoteVideo.classList.remove('hidden');
+        el.voiceStageFallback.classList.add('hidden');
+      }
+    })
+    .subscribe((status) => {
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        showChatAlert('Reconectando canal de chamada...');
+      }
+    });
 }
 
 // ============================================================================
@@ -1512,12 +1553,12 @@ async function applyVideoBitrateLimits(pc, ecoMode) {
   }
 }
 
-function sendSignal(kind, data) {
-  if (!state.signalChannel) return;
-  state.signalChannel.send({
+function sendSignal(event, data) {
+  if (!state.callChannel) return;
+  state.callChannel.send({
     type: 'broadcast',
-    event: 'webrtc-signal',
-    payload: { kind, from: state.currentUser, data: data || null }
+    event,
+    payload: { from: state.currentUser, data: data || null }
   });
 }
 
@@ -1651,7 +1692,7 @@ async function startOutgoingCall(withVideo) {
     await state.pc.setLocalDescription(offer);
 
     el.callStateLabel.textContent = 'Chamando...';
-    sendSignal('call-offer', { sdp: offer, withVideo });
+    sendSignal('incoming-call', { sdp: offer, withVideo, caller: state.currentUser });
 
     clearTimeout(state.ringTimeoutId);
     state.ringTimeoutId = setTimeout(() => {
@@ -1670,6 +1711,7 @@ async function acceptIncomingCall() {
   stopRingtone();
   el.incomingModal.classList.remove('incoming-backdrop');
   el.incomingModal.classList.add('hidden');
+  el.incomingModal.style.cssText = '';
   state.inCall = true;
   state.callMinimized = false;
   state.micMuted = false;
@@ -1715,7 +1757,7 @@ async function acceptIncomingCall() {
     await applyVideoBitrateLimits(state.pc, state.ecoMode480p);
 
     forcePlayRemoteMedia();
-    sendSignal('call-answer', answer);
+    sendSignal('call-accepted', answer);
   } catch (_) {
     endCall(true);
   }
@@ -1725,9 +1767,10 @@ function rejectIncomingCall() {
   stopRingtone();
   el.incomingModal.classList.remove('incoming-backdrop');
   el.incomingModal.classList.add('hidden');
+  el.incomingModal.style.cssText = '';
   state.pendingOffer = null;
   state.pendingIceCandidates = [];
-  sendSignal('call-reject');
+  sendSignal('call-rejected');
 }
 
 async function renegotiateCall() {
@@ -1741,128 +1784,115 @@ async function renegotiateCall() {
   } catch (_) {}
 }
 
-async function handleWebRTCSignal({ kind, from, data }) {
-  if (kind === 'call-offer') {
-    if (state.inCall) {
-      sendSignal('call-reject');
-      return;
-    }
-    state.pendingOffer = data.sdp;
-    state.pendingCallWithVideo = Boolean(data.withVideo);
-    state.pendingCallerName = from || state.partnerName;
-    state.pendingIceCandidates = [];
-
-    el.incomingCallerName.textContent = `${state.pendingCallerName} está ligando ♡`;
-    el.incomingCallType.textContent = state.pendingCallWithVideo
-      ? 'Ligação com vídeo e transmissão'
-      : 'Ligação de voz (estilo Discord)';
-    el.incomingModal.classList.add('incoming-backdrop');
-    el.incomingModal.classList.remove('hidden');
-
-    startRingtone();
-    notifyBackground(
-      `${state.pendingCallerName} está ligando ♡`,
-      state.pendingCallWithVideo ? 'Toque para atender o vídeo' : 'Toque para atender a voz',
-      'call-nosso-mundo'
-    );
-
-    if (navigator.vibrate) {
-      try {
-        navigator.vibrate([400, 200, 400, 200, 400, 200, 400]);
-      } catch (_) {}
-    }
+function handleIncomingCall(payload) {
+  if (!payload || !payload.data || !payload.data.sdp) return;
+  if (state.inCall) {
+    sendSignal('call-rejected');
     return;
   }
+  const data = payload.data;
+  state.pendingOffer = data.sdp;
+  state.pendingCallWithVideo = Boolean(data.withVideo);
+  state.pendingCallerName = payload.from || state.partnerName;
+  state.pendingIceCandidates = [];
 
-  if (kind === 'call-answer') {
-    clearTimeout(state.ringTimeoutId);
-    stopRingtone();
-    if (!state.pc) return;
+  el.incomingCallerName.textContent = `${state.pendingCallerName} está ligando ♡`;
+  el.incomingCallType.textContent = state.pendingCallWithVideo
+    ? 'Ligação com vídeo e transmissão'
+    : 'Ligação de voz (estilo Discord)';
+
+  // Força a exibição imediata do modal no destinatário (Galaxy J5)
+  el.incomingModal.classList.remove('hidden');
+  el.incomingModal.classList.add('incoming-backdrop');
+  el.incomingModal.style.setProperty('display', 'flex', 'important');
+  el.incomingModal.style.setProperty('z-index', '99999', 'important');
+
+  startRingtone();
+  notifyBackground(
+    `${state.pendingCallerName} está ligando ♡`,
+    state.pendingCallWithVideo ? 'Toque para atender o vídeo' : 'Toque para atender a voz',
+    'call-nosso-mundo'
+  );
+
+  if (navigator.vibrate) {
     try {
-      await state.pc.setRemoteDescription(new RTCSessionDescription(data));
-      while (state.pendingIceCandidates.length > 0) {
-        const cand = state.pendingIceCandidates.shift();
+      navigator.vibrate([300, 200, 300, 200, 300, 200, 300]);
+    } catch (_) {}
+  }
+}
+
+async function handleCallAccepted(payload) {
+  if (!payload || !payload.data || !state.pc) return;
+  clearTimeout(state.ringTimeoutId);
+  stopRingtone();
+  try {
+    await state.pc.setRemoteDescription(new RTCSessionDescription(payload.data));
+    while (state.pendingIceCandidates.length > 0) {
+      const cand = state.pendingIceCandidates.shift();
+      try {
         await state.pc.addIceCandidate(new RTCIceCandidate(cand));
-      }
-    } catch (_) {}
-    return;
-  }
-
-  if (kind === 'renegotiate-offer') {
-    if (!state.pc) return;
-    try {
-      await state.pc.setRemoteDescription(new RTCSessionDescription(data));
-      const answer = await state.pc.createAnswer();
-      await state.pc.setLocalDescription(answer);
-      sendSignal('renegotiate-answer', answer);
-      updateRemoteStageVisibility();
-    } catch (_) {}
-    return;
-  }
-
-  if (kind === 'renegotiate-answer') {
-    if (!state.pc) return;
-    try {
-      await state.pc.setRemoteDescription(new RTCSessionDescription(data));
-    } catch (_) {}
-    return;
-  }
-
-  if (kind === 'ice-restart-offer') {
-    if (!state.pc) return;
-    try {
-      await state.pc.setRemoteDescription(new RTCSessionDescription(data));
-      preferVideoCodecs(state.pc);
-      const restartAnswer = await state.pc.createAnswer();
-      await state.pc.setLocalDescription(restartAnswer);
-      sendSignal('ice-restart-answer', restartAnswer);
-    } catch (_) {}
-    return;
-  }
-
-  if (kind === 'ice-restart-answer') {
-    if (!state.pc) return;
-    try {
-      await state.pc.setRemoteDescription(new RTCSessionDescription(data));
-      el.callStateLabel.textContent = 'Reconectado';
-    } catch (_) {}
-    return;
-  }
-
-  if (kind === 'video-off-notify') {
-    el.remoteVideo.classList.add('hidden');
-    el.voiceStageFallback.classList.remove('hidden');
-    return;
-  }
-
-  if (kind === 'video-on-notify') {
-    if (state.remoteStream && state.remoteStream.getVideoTracks().length > 0) {
-      el.remoteVideo.srcObject = state.remoteStream;
-      el.remoteVideo.classList.remove('hidden');
-      el.voiceStageFallback.classList.add('hidden');
-    }
-    return;
-  }
-
-  if (kind === 'ice-candidate' && data) {
-    if (state.pc && state.pc.remoteDescription) {
-      try {
-        await state.pc.addIceCandidate(new RTCIceCandidate(data));
       } catch (_) {}
-    } else {
-      state.pendingIceCandidates.push(data);
     }
-    return;
-  }
+  } catch (_) {}
+}
 
-  if (kind === 'call-reject' || kind === 'call-hangup') {
-    stopRingtone();
-    el.incomingModal.classList.remove('incoming-backdrop');
-    el.incomingModal.classList.add('hidden');
-    state.pendingOffer = null;
-    state.pendingIceCandidates = [];
-    if (state.inCall) endCall(false);
+function handleCallRejectedOrEnded() {
+  stopRingtone();
+  el.incomingModal.classList.remove('incoming-backdrop');
+  el.incomingModal.classList.add('hidden');
+  el.incomingModal.style.cssText = '';
+  state.pendingOffer = null;
+  state.pendingIceCandidates = [];
+  if (state.inCall) endCall(false);
+}
+
+async function handleIncomingIceCandidate(payload) {
+  if (!payload || !payload.data) return;
+  const candidate = payload.data;
+  if (state.pc && state.pc.remoteDescription) {
+    try {
+      await state.pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (_) {}
+  } else {
+    state.pendingIceCandidates.push(candidate);
   }
+}
+
+async function handleRenegotiateOffer(payload) {
+  if (!state.pc || !payload || !payload.data) return;
+  try {
+    await state.pc.setRemoteDescription(new RTCSessionDescription(payload.data));
+    const answer = await state.pc.createAnswer();
+    await state.pc.setLocalDescription(answer);
+    sendSignal('renegotiate-answer', answer);
+    updateRemoteStageVisibility();
+  } catch (_) {}
+}
+
+async function handleRenegotiateAnswer(payload) {
+  if (!state.pc || !payload || !payload.data) return;
+  try {
+    await state.pc.setRemoteDescription(new RTCSessionDescription(payload.data));
+  } catch (_) {}
+}
+
+async function handleIceRestartOffer(payload) {
+  if (!state.pc || !payload || !payload.data) return;
+  try {
+    await state.pc.setRemoteDescription(new RTCSessionDescription(payload.data));
+    preferVideoCodecs(state.pc);
+    const restartAnswer = await state.pc.createAnswer();
+    await state.pc.setLocalDescription(restartAnswer);
+    sendSignal('ice-restart-answer', restartAnswer);
+  } catch (_) {}
+}
+
+async function handleIceRestartAnswer(payload) {
+  if (!state.pc || !payload || !payload.data) return;
+  try {
+    await state.pc.setRemoteDescription(new RTCSessionDescription(payload.data));
+    el.callStateLabel.textContent = 'Reconectado';
+  } catch (_) {}
 }
 
 async function attachOrReplaceVideoStream(newStream, nextMode) {
@@ -2136,7 +2166,7 @@ function endCall(notifyPeer) {
   state.callTimerId = null;
   state.callSeconds = 0;
 
-  if (notifyPeer && state.inCall) sendSignal('call-hangup');
+  if (notifyPeer && state.inCall) sendSignal('call-ended');
 
   stopStreamTracks(state.localAudioStream);
   stopStreamTracks(state.localVideoStream);
