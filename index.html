@@ -432,6 +432,20 @@
         </form>
       </aside>
 
+      <!-- MINI PLAYER LEVE QUANDO TRANSMITINDO VÍDEO DO CELULAR -->
+      <div id="local-media-bar" class="local-media-bar hidden" role="region" aria-label="Controle do vídeo transmitido">
+        <button id="media-play-pause-btn" type="button" class="media-ctrl-btn" aria-label="Pausar ou continuar vídeo">
+          ❚❚
+        </button>
+        <button id="media-back-btn" type="button" class="media-step-btn" aria-label="Voltar 15 segundos">-15s</button>
+        <input id="media-seek-slider" type="range" class="media-seek-slider" min="0" max="1000" value="0" aria-label="Progresso do vídeo" />
+        <button id="media-fwd-btn" type="button" class="media-step-btn" aria-label="Avançar 15 segundos">+15s</button>
+        <span id="media-time-label" class="media-time-label">00:00</span>
+        <button id="media-change-file-btn" type="button" class="media-change-btn" aria-label="Trocar vídeo">
+          Trocar
+        </button>
+      </div>
+
       <div class="call-controls">
         <button id="toggle-mic-btn" type="button" class="call-action-item" aria-label="Silenciar microfone">
           <span class="call-ctrl-btn">
@@ -508,6 +522,22 @@
           </span>
           <span class="call-ctrl-label">Sair</span>
         </button>
+      </div>
+    </div>
+
+    <input id="screen-video-file-input" type="file" accept="video/*" class="hidden" />
+
+    <!-- MODAL: AVISO CASO O NAVEGADOR BLOQUEIE GETDISPLAYMEDIA + STREAM DE FILME LOCAL -->
+    <div id="screen-unsupported-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Transmissão de tela">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Transmissão de Tela</h3>
+        </div>
+        <p id="screen-error-reason" class="confirm-message"></p>
+        <button id="stream-local-video-btn" type="button" class="primary-btn">
+          Transmitir vídeo / filme do celular
+        </button>
+        <button id="close-screen-modal-btn" type="button" class="secondary-btn">Fechar</button>
       </div>
     </div>
 

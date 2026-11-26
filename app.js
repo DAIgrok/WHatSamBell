@@ -37,6 +37,7 @@ const AUDIO_RECORDER_BITRATE = 128000;
 const CONTROLS_AUTOHIDE_MS = 5000;
 
 const PHOTO_2X_PREFIX = '__NM2X__:';
+const CALL_LOG_PREFIX = '__NMCALL__:';
 const MSG_DELETED_MARKER = '__NM_DELETED__';
 
 const ICE_SERVERS = [
@@ -95,6 +96,13 @@ const state = {
   screenMixMicGain: null,
   screenMixScreenGain: null,
   screenAudioTrack: null,
+  localMediaVideoEl: null,
+  localMediaObjectUrl: null,
+  localMediaCanvas: null,
+  localMediaRafId: null,
+  localMediaScaleDownBy: 1,
+  localMediaSeeking: false,
+  localMediaLastUiUpdate: 0,
   pendingOffer: null,
   pendingCallerName: null,
   pendingCallWithVideo: false,
@@ -102,6 +110,11 @@ const state = {
   inCall: false,
   incomingRinging: false,
   callMinimized: false,
+  callIsInitiator: false,
+  callSignaled: false,
+  callInitialVideo: false,
+  callConnected: false,
+  callLogged: false,
   videoMode: 'off', // 'off' | 'camera' | 'screen'
   remoteVideoMode: 'off', // 'off' | 'camera' | 'screen'
   micMuted: false,
@@ -224,6 +237,13 @@ const el = {
   callChatMessages: document.getElementById('call-chat-messages'),
   callChatForm: document.getElementById('call-chat-form'),
   callChatInput: document.getElementById('call-chat-input'),
+  localMediaBar: document.getElementById('local-media-bar'),
+  mediaPlayPauseBtn: document.getElementById('media-play-pause-btn'),
+  mediaBackBtn: document.getElementById('media-back-btn'),
+  mediaSeekSlider: document.getElementById('media-seek-slider'),
+  mediaFwdBtn: document.getElementById('media-fwd-btn'),
+  mediaTimeLabel: document.getElementById('media-time-label'),
+  mediaChangeFileBtn: document.getElementById('media-change-file-btn'),
   toggleMicBtn: document.getElementById('toggle-mic-btn'),
   toggleCamBtn: document.getElementById('toggle-cam-btn'),
   switchCamBtn: document.getElementById('switch-cam-btn'),
@@ -233,6 +253,12 @@ const el = {
   callChatBadge: document.getElementById('call-chat-badge'),
   toggleFullscreenBtn: document.getElementById('toggle-fullscreen-btn'),
   hangupBtn: document.getElementById('hangup-btn'),
+
+  screenVideoFileInput: document.getElementById('screen-video-file-input'),
+  screenUnsupportedModal: document.getElementById('screen-unsupported-modal'),
+  screenErrorReason: document.getElementById('screen-error-reason'),
+  streamLocalVideoBtn: document.getElementById('stream-local-video-btn'),
+  closeScreenModalBtn: document.getElementById('close-screen-modal-btn'),
 
   iosInstallModal: document.getElementById('ios-install-modal'),
   closeIosModalBtn: document.getElementById('close-ios-modal-btn'),
@@ -261,6 +287,31 @@ function getPartnerFor(user) {
 function formatTime(isoString) {
   const d = isoString ? new Date(isoString) : new Date();
   return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+}
+
+function getDateKey(isoString) {
+  const d = isoString ? new Date(isoString) : new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function formatDayLabel(isoString) {
+  const d = isoString ? new Date(isoString) : new Date();
+  const now = new Date();
+  const todayKey = getDateKey(now.toISOString());
+  const yest = new Date(now);
+  yest.setDate(now.getDate() - 1);
+  const yesterdayKey = getDateKey(yest.toISOString());
+  const targetKey = getDateKey(d.toISOString());
+
+  if (targetKey === todayKey) return 'Hoje';
+  if (targetKey === yesterdayKey) return 'Ontem';
+  if (d.getFullYear() === now.getFullYear()) {
+    return d.toLocaleDateString('pt-BR', { day: '2-digit', month: 'long' });
+  }
+  return d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' });
 }
 
 function formatLastSeen(isoString) {
@@ -437,6 +488,30 @@ function urlBase64ToUint8Array(base64String) {
 // ============================================================================
 // METADADOS DE FOTOS (NORMAL, VISUALIZAÇÃO DUPLA 2X E EXCLUSÃO)
 // ============================================================================
+function parseCallLogMeta(msg) {
+  if (!msg || msg.media_type !== 'text' || typeof msg.content !== 'string') return null;
+  if (!msg.content.startsWith(CALL_LOG_PREFIX)) return null;
+  try {
+    const parsed = JSON.parse(msg.content.slice(CALL_LOG_PREFIX.length));
+    return {
+      isCallLog: true,
+      kind: parsed.kind === 'video' ? 'video' : 'voice',
+      status: parsed.status || 'missed',
+      duration: Math.max(0, Number.parseInt(parsed.duration, 10) || 0)
+    };
+  } catch (_) {
+    return { isCallLog: true, kind: 'voice', status: 'missed', duration: 0 };
+  }
+}
+
+function serializeCallLogMeta(kind, status, duration) {
+  return `${CALL_LOG_PREFIX}${JSON.stringify({
+    kind: kind === 'video' ? 'video' : 'voice',
+    status: status || 'missed',
+    duration: Math.max(0, Math.round(duration || 0))
+  })}`;
+}
+
 function parsePhotoMeta(msg) {
   const raw = msg && typeof msg.content === 'string' ? msg.content : '';
   if (raw === MSG_DELETED_MARKER) {
@@ -935,8 +1010,12 @@ function handleIncomingRealtimeMessage(msg) {
       return;
     }
 
-    const preview =
-      msg.media_type === 'image'
+    const callMeta = parseCallLogMeta(msg);
+    const preview = callMeta
+      ? callMeta.kind === 'video'
+        ? '📹 Chamada de vídeo'
+        : '📞 Ligação de voz'
+      : msg.media_type === 'image'
         ? photoMeta.isDouble
           ? '📷 Enviou uma foto 2x'
           : '📷 Enviou uma foto'
@@ -947,7 +1026,9 @@ function handleIncomingRealtimeMessage(msg) {
     if (document.visibilityState === 'visible') {
       const viewport = el.messagesViewport;
       const nearBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 120;
-      if (nearBottom) {
+      if (callMeta) {
+        // Marcador de chamada recém-registrado não precisa disparar toast/som extra
+      } else if (nearBottom) {
         playSoftTone(580, 760);
       } else {
         playMessagePlim();
@@ -1103,10 +1184,10 @@ function subscribeRealtime() {
       handleCallAccepted(payload);
     })
     .on('broadcast', { event: 'call-rejected' }, () => {
-      handleCallRejectedOrEnded();
+      handleCallRejectedOrEnded(true);
     })
     .on('broadcast', { event: 'call-ended' }, () => {
-      handleCallRejectedOrEnded();
+      handleCallRejectedOrEnded(false);
     })
     .on('broadcast', { event: 'ice-candidate' }, ({ payload }) => {
       handleIncomingIceCandidate(payload);
@@ -1201,6 +1282,7 @@ async function loadInitialMessages() {
     }
   });
   el.messagesList.appendChild(frag);
+  rebuildDayDividers();
   scrollToBottom(true);
 
   if (unreadIds.length > 0 && document.visibilityState === 'visible') {
@@ -1268,6 +1350,7 @@ async function loadOlderMessages() {
   });
 
   el.messagesList.insertBefore(frag, el.messagesList.firstChild);
+  rebuildDayDividers();
   el.messagesViewport.scrollTop = el.messagesViewport.scrollHeight - prevHeight;
 
   if (unreadIds.length > 0 && document.visibilityState === 'visible') {
@@ -1336,6 +1419,22 @@ function upgradePendingTicksToDelivered() {
   });
 }
 
+function rebuildDayDividers() {
+  el.messagesList.querySelectorAll('.day-divider').forEach((d) => d.remove());
+  let lastDateKey = '';
+  const rows = Array.from(el.messagesList.querySelectorAll('.msg-row'));
+  rows.forEach((row) => {
+    const key = row.dataset.dateKey;
+    if (key && key !== lastDateKey) {
+      lastDateKey = key;
+      const divider = document.createElement('div');
+      divider.className = 'day-divider';
+      divider.textContent = formatDayLabel(row.dataset.createdAt);
+      el.messagesList.insertBefore(divider, row);
+    }
+  });
+}
+
 function removeMessageFromDom(msgId) {
   state.renderedIds.delete(msgId);
   state.messageCache.delete(msgId);
@@ -1346,7 +1445,8 @@ function removeMessageFromDom(msgId) {
     el.lightboxModal.classList.add('hidden');
     el.lightboxImg.removeAttribute('src');
   }
-  if (el.messagesList.children.length === 0) {
+  rebuildDayDividers();
+  if (!el.messagesList.querySelector('.msg-row')) {
     renderEmptyState(`Envie a primeira mensagem para ${state.partnerName} ♡`);
   }
 }
@@ -1438,6 +1538,63 @@ function updatePhotoMessageInDom(msg) {
   renderPhotoContentIntoSlot(slot, msg);
 }
 
+function buildCallLogCard(callMeta, isMe) {
+  const isVideo = callMeta.kind === 'video';
+  const isMissed = callMeta.status !== 'answered';
+
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = 'call-log-card';
+  card.title = 'Toque para ligar novamente';
+  card.addEventListener('click', () => startOutgoingCall(isVideo));
+
+  const iconWrap = document.createElement('span');
+  iconWrap.className = `call-log-icon ${isMissed ? 'missed' : 'answered'}`;
+
+  if (isVideo) {
+    iconWrap.innerHTML =
+      '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.55-2.28A1 1 0 0121 8.62v6.76a1 1 0 01-1.45.89L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>';
+  } else if (isMe) {
+    // Telefone com seta diagonal saindo (estilo WhatsApp)
+    iconWrap.innerHTML =
+      '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19.95 21q-3.125 0-6.175-1.362t-5.55-3.863-3.862-5.55T3 4.05q0-.45.3-.75t.75-.3H8.1q.35 0 .625.238t.325.562l.65 3.5q.05.4-.025.675T9.4 8.45L6.975 10.9q.5.925 1.187 1.787t1.513 1.663q.775.775 1.625 1.438T13.1 17l2.35-2.35q.225-.225.588-.337t.712-.063l3.45.7q.35.1.575.363T21 15.9v4.05q0 .45-.3.75t-.75.3z"/><path d="M15 10V5h5v2h-1.6l3.3 3.3-1.4 1.4L17 8.4V10h-2z" transform="rotate(90 18 7.5)"/></svg>';
+  } else {
+    // Telefone com seta entrando (estilo WhatsApp)
+    iconWrap.innerHTML =
+      '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19.95 21q-3.125 0-6.175-1.362t-5.55-3.863-3.862-5.55T3 4.05q0-.45.3-.75t.75-.3H8.1q.35 0 .625.238t.325.562l.65 3.5q.05.4-.025.675T9.4 8.45L6.975 10.9q.5.925 1.187 1.787t1.513 1.663q.775.775 1.625 1.438T13.1 17l2.35-2.35q.225-.225.588-.337t.712-.063l3.45.7q.35.1.575.363T21 15.9v4.05q0 .45-.3.75t-.75.3z"/><path d="M14 5h2v4.6l3.3-3.3 1.4 1.4L17.4 11H22v2h-8V5z"/></svg>';
+  }
+
+  const body = document.createElement('span');
+  body.className = 'call-log-body';
+
+  const title = document.createElement('span');
+  title.className = 'call-log-title';
+  title.textContent = isVideo ? 'Chamada de vídeo' : 'Ligação de voz';
+
+  const sub = document.createElement('span');
+  sub.className = 'call-log-sub';
+  if (callMeta.status === 'answered') {
+    const mins = Math.floor(callMeta.duration / 60);
+    const secs = callMeta.duration % 60;
+    sub.textContent =
+      mins > 0
+        ? secs > 0
+          ? `${mins} min ${secs} s`
+          : `${mins} min`
+        : `${callMeta.duration} s`;
+  } else if (callMeta.status === 'rejected') {
+    sub.textContent = isMe ? 'Não atendida' : 'Recusada';
+  } else {
+    sub.textContent = isMe ? 'Não atendida' : 'Perdida';
+  }
+
+  body.appendChild(title);
+  body.appendChild(sub);
+  card.appendChild(iconWrap);
+  card.appendChild(body);
+  return card;
+}
+
 function buildMessageNode(msg) {
   if (!msg || !msg.id || state.renderedIds.has(msg.id)) return null;
   const photoMeta = parsePhotoMeta(msg);
@@ -1451,14 +1608,21 @@ function buildMessageNode(msg) {
   }
 
   const isMe = msg.sender_name === state.currentUser;
+  const callMeta = parseCallLogMeta(msg);
+  const createdIso = msg.created_at || new Date().toISOString();
+
   const row = document.createElement('article');
   row.className = `msg-row ${isMe ? 'me' : 'other'}`;
   row.dataset.id = msg.id;
+  row.dataset.createdAt = createdIso;
+  row.dataset.dateKey = getDateKey(createdIso);
 
   const bubble = document.createElement('div');
   bubble.className = 'msg-bubble';
 
-  if (msg.media_type === 'image') {
+  if (callMeta) {
+    bubble.appendChild(buildCallLogCard(callMeta, isMe));
+  } else if (msg.media_type === 'image') {
     const photoSlot = document.createElement('div');
     photoSlot.className = 'msg-photo-wrap';
     renderPhotoContentIntoSlot(photoSlot, msg);
@@ -1497,7 +1661,7 @@ function buildMessageNode(msg) {
   timeEl.textContent = formatTime(msg.created_at);
   metaEl.appendChild(timeEl);
 
-  if (isMe) {
+  if (isMe && !callMeta) {
     const tickEl = document.createElement('span');
     const info = getTickSymbol(msg);
     tickEl.className = `msg-ticks${info.read ? ' read' : ''}`;
@@ -1522,15 +1686,18 @@ function appendMessage(msg, shouldAutoScroll) {
 
   el.messagesList.appendChild(node);
 
-  while (el.messagesList.children.length > MAX_RENDERED_MESSAGES) {
-    const first = el.messagesList.firstElementChild;
-    if (!first) break;
-    if (first.dataset.id) {
-      state.renderedIds.delete(first.dataset.id);
-      state.messageCache.delete(first.dataset.id);
+  const renderedRows = el.messagesList.querySelectorAll('.msg-row');
+  let excess = renderedRows.length - MAX_RENDERED_MESSAGES;
+  for (let i = 0; i < excess; i += 1) {
+    const oldRow = renderedRows[i];
+    if (oldRow.dataset.id) {
+      state.renderedIds.delete(oldRow.dataset.id);
+      state.messageCache.delete(oldRow.dataset.id);
     }
-    first.remove();
+    oldRow.remove();
   }
+
+  rebuildDayDividers();
 
   if (shouldAutoScroll && (nearBottom || msg.sender_name === state.currentUser)) {
     scrollToBottom(false);
@@ -1610,6 +1777,7 @@ function updateCallChatBadge() {
 
 function appendCallChatMessage(msg) {
   if (!msg || !msg.id || state.callChatIds.has(msg.id)) return;
+  if (parseCallLogMeta(msg)) return;
   const meta = parsePhotoMeta(msg);
   if (meta.deleted) return;
 
@@ -2121,10 +2289,25 @@ async function acquireCameraStream(ecoMode, facingMode, exactFirst = false) {
   throw new Error('Nenhuma câmera disponível');
 }
 
+function isLowMemoryDevice() {
+  return typeof navigator.deviceMemory === 'number' && navigator.deviceMemory <= 2;
+}
+
+function getLocalMediaScaleDown(videoEl, ecoMode) {
+  if (!videoEl || !videoEl.videoHeight) return 1;
+  const maxH = ecoMode || isLowMemoryDevice() ? 480 : 720;
+  if (videoEl.videoHeight <= maxH) return 1;
+  return Math.max(1, Math.min(4, Number((videoEl.videoHeight / maxH).toFixed(2))));
+}
+
 async function applyVideoBitrateLimits(pc, ecoMode) {
   if (!pc || typeof pc.getSenders !== 'function') return;
   const maxBitrate = ecoMode ? WEBRTC_MAX_VIDEO_BITRATE_ECO : WEBRTC_MAX_VIDEO_BITRATE_HD;
   const maxFramerate = ecoMode ? 24 : 30;
+  const scaleDown = state.localMediaVideoEl
+    ? getLocalMediaScaleDown(state.localMediaVideoEl, ecoMode)
+    : 1;
+  state.localMediaScaleDownBy = scaleDown;
 
   for (const sender of pc.getSenders()) {
     if (!sender.track || sender.track.kind !== 'video') continue;
@@ -2133,6 +2316,11 @@ async function applyVideoBitrateLimits(pc, ecoMode) {
       if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
       params.encodings[0].maxBitrate = maxBitrate;
       params.encodings[0].maxFramerate = maxFramerate;
+      if (scaleDown > 1) {
+        params.encodings[0].scaleResolutionDownBy = scaleDown;
+      } else {
+        delete params.encodings[0].scaleResolutionDownBy;
+      }
       params.degradationPreference = 'balanced';
       await sender.setParameters(params);
     } catch (_) {}
@@ -2155,14 +2343,29 @@ function unlockRemoteAudioPlayback() {
   el.remoteVideo.muted = true;
 }
 
+function isLocalStageActive() {
+  return state.videoMode === 'screen' ? !state.pipSwapped : state.pipSwapped;
+}
+
 function updateRemoteStageVisibility() {
+  const liveTracks = state.remoteStream
+    ? state.remoteStream.getVideoTracks().filter((t) => t.readyState === 'live')
+    : [];
   const hasActiveRemoteVideo =
-    state.remoteStream &&
-    state.remoteStream.getVideoTracks().some((t) => t.readyState === 'live' && !t.muted);
+    liveTracks.length > 0 &&
+    (state.remoteVideoMode !== 'off' || liveTracks.some((t) => !t.muted));
+
+  const localOnMain = isLocalStageActive() && state.videoMode !== 'off';
+  el.videoOverlay.classList.toggle('local-stage', localOnMain);
 
   el.remoteVideo.classList.toggle('hidden', !hasActiveRemoteVideo);
   el.remoteVideo.classList.toggle('is-screen', state.remoteVideoMode === 'screen');
-  el.voiceStageFallback.classList.toggle('hidden', hasActiveRemoteVideo);
+  el.voiceStageFallback.classList.toggle('hidden', hasActiveRemoteVideo || localOnMain);
+  if (hasActiveRemoteVideo && el.remoteVideo.srcObject !== state.remoteStream) {
+    el.remoteVideo.srcObject = state.remoteStream;
+    el.remoteVideo.muted = true;
+    el.remoteVideo.play().catch(() => {});
+  }
   applyStageRotationVisual();
 }
 
@@ -2170,7 +2373,24 @@ function handleRemoteVideoModeSync(payload) {
   const mode = payload && payload.data && payload.data.mode;
   if (!mode) return;
   state.remoteVideoMode = mode;
+  if (mode !== 'off' && state.remoteStream && state.remoteStream.getVideoTracks().length > 0) {
+    el.remoteVideo.srcObject = state.remoteStream;
+    el.remoteVideo.play().catch(() => {});
+  }
   updateRemoteStageVisibility();
+}
+
+function findVideoSender(pc) {
+  if (!pc) return null;
+  if (typeof pc.getTransceivers === 'function') {
+    const trans = pc.getTransceivers().find((t) => {
+      const sKind = t.sender && t.sender.track && t.sender.track.kind;
+      const rKind = t.receiver && t.receiver.track && t.receiver.track.kind;
+      return sKind === 'video' || rKind === 'video';
+    });
+    if (trans && trans.sender) return trans.sender;
+  }
+  return pc.getSenders().find((s) => s.track && s.track.kind === 'video') || null;
 }
 
 function preferVideoCodecs(pc) {
@@ -2225,7 +2445,10 @@ function createPeerConnection() {
       el.remoteVideo.muted = true;
       el.remoteVideo.play().catch(() => {});
       event.track.onmute = updateRemoteStageVisibility;
-      event.track.onunmute = updateRemoteStageVisibility;
+      event.track.onunmute = () => {
+        el.remoteVideo.play().catch(() => {});
+        updateRemoteStageVisibility();
+      };
       event.track.onended = updateRemoteStageVisibility;
     }
     updateRemoteStageVisibility();
@@ -2234,6 +2457,7 @@ function createPeerConnection() {
   pc.onconnectionstatechange = () => {
     const st = pc.connectionState;
     if (st === 'connected') {
+      state.callConnected = true;
       clearTimeout(state.iceRestartTimerId);
       startCallTimer();
       applyVideoBitrateLimits(pc, state.ecoMode480p);
@@ -2259,12 +2483,46 @@ function createPeerConnection() {
   return pc;
 }
 
+async function saveCallLogMarker(status, durationSeconds) {
+  if (!state.supabase || !state.callIsInitiator || !state.callSignaled || state.callLogged) return;
+  state.callLogged = true;
+
+  const content = serializeCallLogMeta(
+    state.callInitialVideo ? 'video' : 'voice',
+    status,
+    durationSeconds
+  );
+
+  try {
+    const { data, error } = await state.supabase
+      .from('messages')
+      .insert({
+        sender_name: state.currentUser,
+        content,
+        media_type: 'text',
+        is_read: false
+      })
+      .select('id, sender_name, content, media_url, media_type, is_read, read_at, created_at')
+      .single();
+
+    if (!error && data) {
+      appendMessage(data, true);
+      broadcastMessage(data);
+    }
+  } catch (_) {}
+}
+
 async function startOutgoingCall(withVideo) {
   if (state.inCall || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
 
   try {
     state.inCall = true;
     state.callMinimized = false;
+    state.callIsInitiator = true;
+    state.callSignaled = false;
+    state.callInitialVideo = Boolean(withVideo);
+    state.callConnected = false;
+    state.callLogged = false;
     state.pendingIceCandidates = [];
     state.micMuted = false;
     state.soundMuted = false;
@@ -2276,7 +2534,7 @@ async function startOutgoingCall(withVideo) {
     state.inCallUnreadCount = 0;
 
     unlockRemoteAudioPlayback();
-    el.videoOverlay.classList.remove('hidden', 'pip-swapped', 'controls-hidden');
+    el.videoOverlay.classList.remove('hidden', 'local-stage', 'has-local-media', 'controls-hidden');
     el.callChatOverlay.classList.add('hidden');
     el.activeCallBanner.classList.add('hidden');
     el.callPartnerLabel.textContent = state.partnerName;
@@ -2307,6 +2565,7 @@ async function startOutgoingCall(withVideo) {
     await state.pc.setLocalDescription(offer);
 
     el.callStateLabel.textContent = 'Chamando...';
+    state.callSignaled = true;
     sendSignal('incoming-call', {
       caller: state.currentUser,
       callType: withVideo ? 'video' : 'audio',
@@ -2317,7 +2576,8 @@ async function startOutgoingCall(withVideo) {
 
     clearTimeout(state.ringTimeoutId);
     state.ringTimeoutId = setTimeout(() => {
-      if (state.inCall && state.pc && state.pc.connectionState !== 'connected') {
+      if (state.inCall && !state.callConnected) {
+        saveCallLogMarker('missed', 0);
         endCall(true);
       }
     }, 45000);
@@ -2338,6 +2598,11 @@ async function acceptIncomingCall() {
 
   state.inCall = true;
   state.callMinimized = false;
+  state.callIsInitiator = false;
+  state.callSignaled = false;
+  state.callInitialVideo = Boolean(state.pendingCallWithVideo);
+  state.callConnected = false;
+  state.callLogged = true;
   state.micMuted = false;
   state.soundMuted = false;
   state.facingMode = 'user';
@@ -2350,7 +2615,7 @@ async function acceptIncomingCall() {
   unlockRemoteAudioPlayback();
 
   try {
-    el.videoOverlay.classList.remove('hidden', 'pip-swapped', 'controls-hidden');
+    el.videoOverlay.classList.remove('hidden', 'local-stage', 'has-local-media', 'controls-hidden');
     el.callChatOverlay.classList.add('hidden');
     el.activeCallBanner.classList.add('hidden');
     el.callPartnerLabel.textContent = state.pendingCallerName || state.partnerName;
@@ -2412,6 +2677,7 @@ function rejectIncomingCall() {
 async function renegotiateCall() {
   if (!state.pc) return;
   try {
+    if (state.pc.signalingState !== 'stable') return;
     preferVideoCodecs(state.pc);
     const offer = await state.pc.createOffer();
     await state.pc.setLocalDescription(offer);
@@ -2479,7 +2745,7 @@ async function handleCallAccepted(payload) {
   } catch (_) {}
 }
 
-function handleCallRejectedOrEnded() {
+function handleCallRejectedOrEnded(wasRejected = false) {
   stopRingtone();
   state.incomingRinging = false;
   el.incomingModal.classList.remove('incoming-backdrop');
@@ -2487,7 +2753,15 @@ function handleCallRejectedOrEnded() {
   el.incomingModal.style.cssText = '';
   state.pendingOffer = null;
   state.pendingIceCandidates = [];
-  if (state.inCall) endCall(false);
+  if (state.inCall) {
+    if (state.callIsInitiator) {
+      saveCallLogMarker(
+        state.callConnected ? 'answered' : wasRejected ? 'rejected' : 'missed',
+        state.callSeconds
+      );
+    }
+    endCall(false);
+  }
 }
 
 async function handleIncomingIceCandidate(payload) {
@@ -2506,9 +2780,16 @@ async function handleRenegotiateOffer(payload) {
   if (!state.pc || !payload || !payload.data) return;
   try {
     await state.pc.setRemoteDescription(new RTCSessionDescription(payload.data));
+    while (state.pendingIceCandidates.length > 0) {
+      const cand = state.pendingIceCandidates.shift();
+      try {
+        await state.pc.addIceCandidate(new RTCIceCandidate(cand));
+      } catch (_) {}
+    }
     const answer = await state.pc.createAnswer();
     await state.pc.setLocalDescription(answer);
     sendSignal('renegotiate-answer', answer);
+    forcePlayRemoteMedia();
     updateRemoteStageVisibility();
   } catch (_) {}
 }
@@ -2517,6 +2798,7 @@ async function handleRenegotiateAnswer(payload) {
   if (!state.pc || !payload || !payload.data) return;
   try {
     await state.pc.setRemoteDescription(new RTCSessionDescription(payload.data));
+    forcePlayRemoteMedia();
   } catch (_) {}
 }
 
@@ -2542,9 +2824,67 @@ async function handleIceRestartAnswer(payload) {
 // ============================================================================
 // MIXER DE ÁUDIO DA TRANSMISSÃO (MIC MUTADO NÃO CORTA ÁUDIO DO FILME!)
 // ============================================================================
-async function setupScreenAudioMix(screenAudioTrack) {
+function updateLocalMediaBarUi(force = false) {
+  const v = state.localMediaVideoEl;
+  if (!v || !el.localMediaBar) return;
+  const now = Date.now();
+  if (!force && now - state.localMediaLastUiUpdate < 500) return;
+  state.localMediaLastUiUpdate = now;
+
+  if (el.mediaPlayPauseBtn) {
+    el.mediaPlayPauseBtn.textContent = v.paused ? '▶' : '❚❚';
+  }
+  const dur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+  const cur = Number.isFinite(v.currentTime) ? v.currentTime : 0;
+  if (el.mediaSeekSlider && !state.localMediaSeeking) {
+    el.mediaSeekSlider.value = dur > 0 ? String(Math.round((cur / dur) * 1000)) : '0';
+  }
+  if (el.mediaTimeLabel) {
+    el.mediaTimeLabel.textContent =
+      dur > 0
+        ? `${formatSeconds(Math.floor(cur))} / ${formatSeconds(Math.floor(dur))}`
+        : formatSeconds(Math.floor(cur));
+  }
+}
+
+function cleanupLocalMediaFile() {
+  if (state.localMediaRafId) {
+    cancelAnimationFrame(state.localMediaRafId);
+    state.localMediaRafId = null;
+  }
+  if (state.localMediaCanvas) {
+    try {
+      state.localMediaCanvas.width = 0;
+      state.localMediaCanvas.height = 0;
+    } catch (_) {}
+    state.localMediaCanvas = null;
+  }
+  if (state.localMediaVideoEl) {
+    try {
+      state.localMediaVideoEl.onended = null;
+      state.localMediaVideoEl.ontimeupdate = null;
+      state.localMediaVideoEl.pause();
+      state.localMediaVideoEl.removeAttribute('src');
+      state.localMediaVideoEl.load();
+      state.localMediaVideoEl.remove();
+    } catch (_) {}
+    state.localMediaVideoEl = null;
+  }
+  if (state.localMediaObjectUrl) {
+    try {
+      URL.revokeObjectURL(state.localMediaObjectUrl);
+    } catch (_) {}
+    state.localMediaObjectUrl = null;
+  }
+  state.localMediaScaleDownBy = 1;
+  state.localMediaSeeking = false;
+  if (el.localMediaBar) el.localMediaBar.classList.add('hidden');
+  if (el.videoOverlay) el.videoOverlay.classList.remove('has-local-media');
+}
+
+async function setupScreenAudioMix(screenAudioSource) {
   teardownScreenAudioMix(false);
-  if (!screenAudioTrack || !state.localAudioStream || !state.pc) return;
+  if (!screenAudioSource || !state.localAudioStream || !state.pc) return;
 
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -2564,10 +2904,18 @@ async function setupScreenAudioMix(screenAudioTrack) {
     micGain.gain.value = state.micMuted ? 0 : 1;
     screenGain.gain.value = 1;
 
-    const screenSource = mixCtx.createMediaStreamSource(new MediaStream([screenAudioTrack]));
-    const micSource = mixCtx.createMediaStreamSource(state.localAudioStream);
+    let screenNode = null;
+    if (screenAudioSource instanceof HTMLMediaElement) {
+      screenNode = mixCtx.createMediaElementSource(screenAudioSource);
+      // Permite que quem está transmitindo o arquivo também ouça nos próprios fones/alto-falante
+      screenNode.connect(mixCtx.destination);
+    } else {
+      state.screenAudioTrack = screenAudioSource;
+      screenNode = mixCtx.createMediaStreamSource(new MediaStream([screenAudioSource]));
+    }
 
-    screenSource.connect(screenGain).connect(dest);
+    const micSource = mixCtx.createMediaStreamSource(state.localAudioStream);
+    screenNode.connect(screenGain).connect(dest);
     micSource.connect(micGain).connect(dest);
 
     const mixedTrack = dest.stream.getAudioTracks()[0];
@@ -2576,7 +2924,6 @@ async function setupScreenAudioMix(screenAudioTrack) {
       state.screenMixCtx = mixCtx;
       state.screenMixMicGain = micGain;
       state.screenMixScreenGain = screenGain;
-      state.screenAudioTrack = screenAudioTrack;
       await audioSender.replaceTrack(mixedTrack);
     } else {
       mixCtx.close();
@@ -2610,52 +2957,29 @@ function teardownScreenAudioMix(restoreMicTrack = true) {
   }
 }
 
-async function acquireScreenShareStream() {
-  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
-    throw new Error('UNSUPPORTED');
+function openScreenUnsupportedModal(reasonText) {
+  if (!el.screenUnsupportedModal) {
+    showCallToast(reasonText);
+    return;
   }
+  el.screenErrorReason.textContent = reasonText;
+  el.screenUnsupportedModal.classList.remove('hidden');
+}
 
-  // 1. Tentativa ideal 720p@30fps + áudio bruto do filme (sem supressão de voz)
-  try {
-    return await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        width: { ideal: 1280, max: 1280 },
-        height: { ideal: 720, max: 720 },
-        frameRate: { ideal: 30, max: 30 }
-      },
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false
-      }
-    });
-  } catch (err) {
-    if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) throw err;
+function closeScreenUnsupportedModal() {
+  if (el.screenUnsupportedModal) {
+    el.screenUnsupportedModal.classList.add('hidden');
   }
-
-  // 2. Fallback flexível mantendo áudio do sistema
-  try {
-    return await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: true
-    });
-  } catch (err) {
-    if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) throw err;
-  }
-
-  // 3. Último fallback apenas vídeo caso o dispositivo bloqueie captura de áudio interno
-  const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-  showCallToast('Tela transmitida (este aparelho não liberou áudio interno do sistema).');
-  return stream;
 }
 
 async function attachOrReplaceVideoStream(newStream, nextMode) {
   const newTrack = newStream.getVideoTracks()[0];
   if (!newTrack) return;
 
-  const existingSender = state.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+  const existingSender = findVideoSender(state.pc);
   state.localVideoStream = newStream;
   el.localVideo.srcObject = newStream;
+  state.pipSwapped = false;
 
   if (existingSender) {
     await existingSender.replaceTrack(newTrack);
@@ -2669,6 +2993,118 @@ async function attachOrReplaceVideoStream(newStream, nextMode) {
   state.videoMode = nextMode;
   sendSignal('video-mode-sync', { mode: nextMode });
   updateCallUIState();
+}
+
+function createLowRamCanvasVideoStream(videoEl, targetFps) {
+  const srcW = videoEl.videoWidth || 640;
+  const srcH = videoEl.videoHeight || 360;
+  const maxWidth = state.ecoMode480p || isLowMemoryDevice() ? 640 : 854;
+  const scale = Math.min(1, maxWidth / srcW);
+  const w = Math.max(2, Math.round((srcW * scale) / 2) * 2);
+  const h = Math.max(2, Math.round((srcH * scale) / 2) * 2);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  state.localMediaCanvas = canvas;
+
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const minIntervalMs = Math.round(1000 / targetFps);
+  let lastDrawAt = 0;
+
+  const drawFrame = (now) => {
+    if (!state.localMediaVideoEl || !state.localMediaCanvas) return;
+    if (!videoEl.paused && !videoEl.ended && now - lastDrawAt >= minIntervalMs) {
+      lastDrawAt = now;
+      ctx.drawImage(videoEl, 0, 0, w, h);
+    }
+    state.localMediaRafId = requestAnimationFrame(drawFrame);
+  };
+  ctx.drawImage(videoEl, 0, 0, w, h);
+  state.localMediaRafId = requestAnimationFrame(drawFrame);
+
+  return canvas.captureStream(targetFps);
+}
+
+async function startLocalVideoFileStream(file) {
+  if (!file || !state.inCall || !state.pc) return;
+  closeScreenUnsupportedModal();
+
+  teardownScreenAudioMix(true);
+  cleanupLocalMediaFile();
+  stopStreamTracks(state.localVideoStream);
+  state.localVideoStream = null;
+  el.localVideo.srcObject = null;
+
+  try {
+    // URL.createObjectURL faz streaming direto do armazenamento sem carregar o arquivo inteiro na RAM
+    const objectUrl = URL.createObjectURL(file);
+    const hiddenVideo = document.createElement('video');
+    hiddenVideo.className = 'hidden';
+    hiddenVideo.playsInline = true;
+    hiddenVideo.loop = false;
+    hiddenVideo.preload = 'metadata';
+    hiddenVideo.crossOrigin = 'anonymous';
+    hiddenVideo.src = objectUrl;
+    document.body.appendChild(hiddenVideo);
+
+    state.localMediaObjectUrl = objectUrl;
+    state.localMediaVideoEl = hiddenVideo;
+
+    await new Promise((resolve) => {
+      const done = () => resolve();
+      hiddenVideo.addEventListener('loadedmetadata', done, { once: true });
+      hiddenVideo.addEventListener('error', done, { once: true });
+      setTimeout(done, 4000);
+    });
+
+    await hiddenVideo.play();
+
+    // Ativa automaticamente modo Eco 480p em celulares com pouca RAM (ex.: Galaxy J5) ou vídeos muito pesados
+    const targetFps = state.ecoMode480p || isLowMemoryDevice() ? 24 : 30;
+    state.localMediaScaleDownBy = getLocalMediaScaleDown(hiddenVideo, state.ecoMode480p);
+
+    const captureFn = hiddenVideo.captureStream || hiddenVideo.mozCaptureStream;
+    let rawStream = typeof captureFn === 'function' ? captureFn.call(hiddenVideo, targetFps) : null;
+    let videoTrack = rawStream && rawStream.getVideoTracks()[0];
+
+    if (!videoTrack) {
+      rawStream = createLowRamCanvasVideoStream(hiddenVideo, 24);
+      videoTrack = rawStream && rawStream.getVideoTracks()[0];
+    }
+
+    if (!videoTrack) {
+      throw new Error('NO_VIDEO_TRACK');
+    }
+
+    // Stream enxuto apenas com vídeo para não duplicar faixa de áudio na memória
+    const videoOnlyStream = new MediaStream([videoTrack]);
+    await setupScreenAudioMix(hiddenVideo);
+
+    hiddenVideo.ontimeupdate = () => updateLocalMediaBarUi(false);
+    hiddenVideo.onended = () => {
+      if (state.videoMode === 'screen') {
+        teardownScreenAudioMix(true);
+        stopLocalVideoTrack();
+        state.videoMode = 'off';
+        sendSignal('video-mode-sync', { mode: 'off' });
+        sendSignal('video-off-notify');
+        updateCallUIState();
+        showCallToast('Vídeo finalizado');
+      }
+    };
+
+    await attachOrReplaceVideoStream(videoOnlyStream, 'screen');
+    updateLocalMediaBarUi(true);
+    showCallToast('Transmitindo vídeo do celular (modo leve) ♡');
+  } catch (_) {
+    cleanupLocalMediaFile();
+    teardownScreenAudioMix(true);
+    state.videoMode = 'off';
+    sendSignal('video-mode-sync', { mode: 'off' });
+    updateCallUIState();
+    showCallToast('Não foi possível transmitir este arquivo de vídeo.');
+  }
 }
 
 async function toggleLocalVideoMode(targetMode) {
@@ -2685,36 +3121,65 @@ async function toggleLocalVideoMode(targetMode) {
     return;
   }
 
-  // Libera vídeo anterior ANTES de abrir nova fonte (crucial no hardware Android J5)
-  teardownScreenAudioMix(true);
-  stopStreamTracks(state.localVideoStream);
-  state.localVideoStream = null;
-  el.localVideo.srcObject = null;
+  if (targetMode === 'screen') {
+    const hasDisplayCapture = Boolean(
+      navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function'
+    );
 
-  try {
-    if (targetMode === 'camera') {
-      const camStream = await acquireCameraStream(state.ecoMode480p, state.facingMode, false);
-      await attachOrReplaceVideoStream(camStream, 'camera');
+    // No Chrome Mobile (Android/iOS), getDisplayMedia não existe: abre direto o seletor de vídeo/filme do celular
+    // mantendo a câmera atual intacta caso o usuário cancele o seletor.
+    if (!hasDisplayCapture) {
+      if (el.screenVideoFileInput) {
+        el.screenVideoFileInput.click();
+      } else {
+        showCallToast('Selecione um arquivo de vídeo para transmitir.');
+      }
       return;
     }
 
-    if (targetMode === 'screen') {
-      const screenStream = await acquireScreenShareStream();
+    // Libera vídeo anterior de forma síncrona ANTES do getDisplayMedia para não perder o gesto do toque!
+    teardownScreenAudioMix(true);
+    cleanupLocalMediaFile();
+    stopStreamTracks(state.localVideoStream);
+    state.localVideoStream = null;
+    el.localVideo.srcObject = null;
+
+    const startedAt = Date.now();
+    let screenStream = null;
+
+    try {
+      try {
+        screenStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true
+        });
+      } catch (firstErr) {
+        if (firstErr && (firstErr.name === 'NotAllowedError' || firstErr.name === 'AbortError')) {
+          throw firstErr;
+        }
+        screenStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: false
+        });
+      }
+
       const screenTrack = screenStream.getVideoTracks()[0];
       const screenAudioTrack = screenStream.getAudioTracks()[0];
 
       if (screenTrack && typeof screenTrack.applyConstraints === 'function') {
         try {
           await screenTrack.applyConstraints({
-            width: { max: 1280 },
-            height: { max: 720 },
-            frameRate: { max: 30 }
+            width: { ideal: 1280, max: 1280 },
+            height: { ideal: 720, max: 720 },
+            frameRate: { ideal: 30, max: 30 }
           });
         } catch (_) {}
       }
 
       if (screenAudioTrack) {
         await setupScreenAudioMix(screenAudioTrack);
+      } else {
+        showCallToast('Tela transmitida (selecione "Compartilhar áudio" para o som do filme).');
       }
 
       if (screenTrack) {
@@ -2731,26 +3196,52 @@ async function toggleLocalVideoMode(targetMode) {
       }
 
       await attachOrReplaceVideoStream(screenStream, 'screen');
-      showCallToast('Transmissão de tela ativa em 720p ♡');
+      showCallToast('Transmissão de tela ativa ♡');
+    } catch (err) {
+      stopStreamTracks(screenStream);
+      teardownScreenAudioMix(true);
+      state.videoMode = 'off';
+      sendSignal('video-mode-sync', { mode: 'off' });
+      updateCallUIState();
+
+      const elapsed = Date.now() - startedAt;
+      if (err && err.name === 'NotAllowedError' && elapsed < 250) {
+        openScreenUnsupportedModal(
+          'Este navegador bloqueou a captura da tela do sistema. Escolha um vídeo/filme salvo no aparelho para transmitir com baixo consumo de memória:'
+        );
+      } else if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) {
+        showCallToast('Seleção de tela cancelada.');
+      } else {
+        openScreenUnsupportedModal(
+          'Este navegador não suportou captura de tela do sistema. Escolha um vídeo/filme salvo no aparelho para transmitir ao vivo:'
+        );
+      }
     }
-  } catch (err) {
-    teardownScreenAudioMix(true);
+    return;
+  }
+
+  // Modo câmera
+  teardownScreenAudioMix(true);
+  cleanupLocalMediaFile();
+  stopStreamTracks(state.localVideoStream);
+  state.localVideoStream = null;
+  el.localVideo.srcObject = null;
+
+  try {
+    const camStream = await acquireCameraStream(state.ecoMode480p, state.facingMode, false);
+    await attachOrReplaceVideoStream(camStream, 'camera');
+  } catch (_) {
     state.videoMode = 'off';
     sendSignal('video-mode-sync', { mode: 'off' });
     updateCallUIState();
-    if (err && err.message === 'UNSUPPORTED') {
-      showCallToast('Erro: este navegador não suporta transmissão de tela. Use o Google Chrome.');
-    } else if (err && err.name === 'NotAllowedError') {
-      showCallToast('Erro: permissão para transmitir tela foi cancelada.');
-    } else {
-      showCallToast('Erro: não foi possível iniciar a transmissão de tela.');
-    }
+    showCallToast('Erro ao ligar a câmera.');
   }
 }
 
 function stopLocalVideoTrack() {
+  cleanupLocalMediaFile();
   if (state.pc) {
-    const sender = state.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    const sender = findVideoSender(state.pc);
     if (sender) {
       try {
         sender.replaceTrack(null);
@@ -2867,9 +3358,22 @@ function forcePlayRemoteMedia() {
 // CONTROLES DE PALCO: PIP, ROTAÇÃO, TELA CHEIA E AUTO-OCULTAR (1 CLIQUE / 5S)
 // ============================================================================
 function applyStageRotationVisual() {
-  const isNativeLandscape = window.innerWidth > window.innerHeight;
-  const useCssRotation = state.isStageRotated && !isNativeLandscape && !state.pipSwapped;
-  el.remoteVideo.classList.toggle('stage-rotated', useCssRotation);
+  const overlayW = el.videoOverlay ? el.videoOverlay.clientWidth : window.innerWidth;
+  const overlayH = el.videoOverlay ? el.videoOverlay.clientHeight : window.innerHeight;
+  const isNativeLandscape = overlayW > overlayH;
+  const useCssRotation = state.isStageRotated && !isNativeLandscape;
+  const localOnMain = isLocalStageActive() && state.videoMode !== 'off';
+
+  if (el.videoOverlay && useCssRotation && overlayW > 0 && overlayH > 0) {
+    el.videoOverlay.style.setProperty('--stage-rot-w', `${overlayH}px`);
+    el.videoOverlay.style.setProperty('--stage-rot-h', `${overlayW}px`);
+  } else if (el.videoOverlay) {
+    el.videoOverlay.style.removeProperty('--stage-rot-w');
+    el.videoOverlay.style.removeProperty('--stage-rot-h');
+  }
+
+  el.remoteVideo.classList.toggle('stage-rotated', useCssRotation && !localOnMain);
+  el.localVideo.classList.toggle('stage-rotated', useCssRotation && localOnMain);
   if (el.rotateStageBtn) {
     el.rotateStageBtn.classList.toggle('active', state.isStageRotated);
   }
@@ -2904,8 +3408,7 @@ async function toggleStageRotation() {
 function swapPipVideos() {
   if (!state.inCall) return;
   state.pipSwapped = !state.pipSwapped;
-  el.videoOverlay.classList.toggle('pip-swapped', state.pipSwapped);
-  applyStageRotationVisual();
+  updateCallUIState();
   resetControlsAutoHideOnInteraction();
 }
 
@@ -2988,9 +3491,14 @@ function restoreCallOverlay() {
 
 function updateCallUIState() {
   const hasLocalVideo = state.videoMode !== 'off';
+  const hasLocalMediaPlayer = Boolean(state.localMediaVideoEl && state.videoMode === 'screen');
   el.localVideo.classList.toggle('hidden', !hasLocalVideo);
+  el.localVideo.classList.toggle('is-screen', state.videoMode === 'screen');
   el.localVideo.classList.toggle('mirrored', state.videoMode === 'camera' && state.facingMode === 'user');
   el.switchCamBtn.disabled = state.videoMode === 'screen';
+
+  if (el.localMediaBar) el.localMediaBar.classList.toggle('hidden', !hasLocalMediaPlayer);
+  el.videoOverlay.classList.toggle('has-local-media', hasLocalMediaPlayer);
 
   el.toggleMicBtn.classList.toggle('muted', state.micMuted);
   el.toggleSoundBtn.classList.toggle('muted-sound', state.soundMuted);
@@ -3024,6 +3532,14 @@ function startCallTimer() {
 }
 
 function endCall(notifyPeer) {
+  const durationSnapshot = state.callSeconds;
+  const shouldLog = state.inCall && state.callIsInitiator && state.callSignaled && !state.callLogged;
+  const logStatus = state.callConnected ? 'answered' : 'missed';
+
+  if (shouldLog) {
+    saveCallLogMarker(logStatus, durationSnapshot);
+  }
+
   clearTimeout(state.ringTimeoutId);
   clearTimeout(state.callToastTimerId);
   clearTimeout(state.iceRestartTimerId);
@@ -3031,6 +3547,8 @@ function endCall(notifyPeer) {
   clearInterval(state.callTimerId);
   stopRingtone();
   teardownScreenAudioMix(false);
+  cleanupLocalMediaFile();
+  closeScreenUnsupportedModal();
 
   state.callTimerId = null;
   state.callSeconds = 0;
@@ -3075,6 +3593,11 @@ function endCall(notifyPeer) {
 
   state.inCall = false;
   state.callMinimized = false;
+  state.callIsInitiator = false;
+  state.callSignaled = false;
+  state.callInitialVideo = false;
+  state.callConnected = false;
+  state.callLogged = false;
   state.videoMode = 'off';
   state.remoteVideoMode = 'off';
   state.pipSwapped = false;
@@ -3092,10 +3615,13 @@ function endCall(notifyPeer) {
   el.callToast.classList.add('hidden');
   el.callChatOverlay.classList.add('hidden');
   el.remoteVideo.classList.remove('stage-rotated', 'is-screen');
+  el.localVideo.classList.remove('stage-rotated', 'is-screen', 'mirrored');
+  el.videoOverlay.style.removeProperty('--stage-rot-w');
+  el.videoOverlay.style.removeProperty('--stage-rot-h');
   if (el.rotateStageBtn) el.rotateStageBtn.classList.remove('active');
   el.toggleCallChatBtn.classList.remove('active-feature');
   el.toggleFullscreenBtn.classList.remove('active-feature');
-  el.videoOverlay.classList.remove('pip-swapped', 'controls-hidden', 'pseudo-fullscreen');
+  el.videoOverlay.classList.remove('local-stage', 'has-local-media', 'controls-hidden', 'pseudo-fullscreen');
   el.videoOverlay.classList.add('hidden');
   el.activeCallBanner.classList.add('hidden');
   el.incomingModal.classList.remove('incoming-backdrop');
@@ -3211,6 +3737,72 @@ function bindEvents() {
   el.toggleSoundBtn.addEventListener('click', toggleSound);
   el.toggleCamBtn.addEventListener('click', () => toggleLocalVideoMode('camera'));
   el.shareScreenBtn.addEventListener('click', () => toggleLocalVideoMode('screen'));
+  if (el.streamLocalVideoBtn && el.screenVideoFileInput) {
+    el.streamLocalVideoBtn.addEventListener('click', () => el.screenVideoFileInput.click());
+    el.screenVideoFileInput.addEventListener('change', (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (file) startLocalVideoFileStream(file);
+    });
+  }
+  if (el.closeScreenModalBtn) {
+    el.closeScreenModalBtn.addEventListener('click', closeScreenUnsupportedModal);
+  }
+  if (el.screenUnsupportedModal) {
+    el.screenUnsupportedModal.addEventListener('click', (e) => {
+      if (e.target === el.screenUnsupportedModal) closeScreenUnsupportedModal();
+    });
+  }
+  if (el.mediaPlayPauseBtn) {
+    el.mediaPlayPauseBtn.addEventListener('click', () => {
+      const v = state.localMediaVideoEl;
+      if (!v) return;
+      resetControlsAutoHideOnInteraction();
+      if (v.paused) v.play().catch(() => {});
+      else v.pause();
+      updateLocalMediaBarUi(true);
+    });
+  }
+  if (el.mediaBackBtn) {
+    el.mediaBackBtn.addEventListener('click', () => {
+      const v = state.localMediaVideoEl;
+      if (!v) return;
+      resetControlsAutoHideOnInteraction();
+      v.currentTime = Math.max(0, v.currentTime - 15);
+      updateLocalMediaBarUi(true);
+    });
+  }
+  if (el.mediaFwdBtn) {
+    el.mediaFwdBtn.addEventListener('click', () => {
+      const v = state.localMediaVideoEl;
+      if (!v) return;
+      resetControlsAutoHideOnInteraction();
+      const maxDur = Number.isFinite(v.duration) ? v.duration : v.currentTime + 15;
+      v.currentTime = Math.min(maxDur, v.currentTime + 15);
+      updateLocalMediaBarUi(true);
+    });
+  }
+  if (el.mediaSeekSlider) {
+    el.mediaSeekSlider.addEventListener('input', () => {
+      state.localMediaSeeking = true;
+      resetControlsAutoHideOnInteraction();
+    });
+    el.mediaSeekSlider.addEventListener('change', () => {
+      const v = state.localMediaVideoEl;
+      state.localMediaSeeking = false;
+      if (v && Number.isFinite(v.duration) && v.duration > 0) {
+        const pct = Number(el.mediaSeekSlider.value) / 1000;
+        v.currentTime = Math.max(0, Math.min(v.duration, pct * v.duration));
+      }
+      updateLocalMediaBarUi(true);
+    });
+  }
+  if (el.mediaChangeFileBtn && el.screenVideoFileInput) {
+    el.mediaChangeFileBtn.addEventListener('click', () => {
+      resetControlsAutoHideOnInteraction();
+      el.screenVideoFileInput.click();
+    });
+  }
   el.switchCamBtn.addEventListener('click', switchCamera);
   if (el.rotateStageBtn) el.rotateStageBtn.addEventListener('click', toggleStageRotation);
   el.ecoModeBtn.addEventListener('click', toggleEcoMode);
@@ -3226,10 +3818,11 @@ function bindEvents() {
     await sendTextContent(txt);
   });
 
-  // Toque no PiP alterna câmeras; toque em qualquer área livre oculta/exibe barras com 1 clique
+  // Toque no PiP alterna fundo/canto; toque no vídeo de fundo ou área livre oculta/exibe barras com 1 clique
   el.localVideo.addEventListener('click', (e) => {
     e.stopPropagation();
-    if (!state.pipSwapped) {
+    const localOnMain = isLocalStageActive() && state.videoMode !== 'off';
+    if (!localOnMain) {
       swapPipVideos();
     } else {
       toggleControlsVisibilityByTap();
@@ -3238,7 +3831,8 @@ function bindEvents() {
 
   el.remoteVideo.addEventListener('click', (e) => {
     e.stopPropagation();
-    if (state.pipSwapped) {
+    const localOnMain = isLocalStageActive() && state.videoMode !== 'off';
+    if (localOnMain) {
       swapPipVideos();
     } else {
       toggleControlsVisibilityByTap();
@@ -3246,7 +3840,11 @@ function bindEvents() {
   });
 
   el.videoOverlay.addEventListener('click', (e) => {
-    if (e.target.closest('.call-top-bar, .call-controls, .call-chat-overlay, #call-toast, button, input, form')) {
+    if (
+      e.target.closest(
+        '.call-top-bar, .call-controls, .call-chat-overlay, #local-media-bar, #call-toast, button, input, form'
+      )
+    ) {
       return;
     }
     toggleControlsVisibilityByTap();
@@ -3258,6 +3856,7 @@ function bindEvents() {
   document.addEventListener('fullscreenchange', () => {
     const active = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
     el.toggleFullscreenBtn.classList.toggle('active-feature', active);
+    setTimeout(applyStageRotationVisual, 60);
   });
 
   // Sincroniza mensagens perdidas e marca como lidas ao voltar ao app
