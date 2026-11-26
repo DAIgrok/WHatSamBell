@@ -227,7 +227,7 @@
 
       <!-- Barra de envio -->
       <footer id="composer-bar" class="composer-bar">
-        <input id="photo-input" type="file" accept="image/*" class="hidden" />
+        <input id="photo-input" type="file" accept="image/*" class="sr-file-input" />
         <button
           id="photo-btn"
           type="button"
@@ -325,11 +325,14 @@
       </div>
     </div>
 
-    <!-- MODAL: VISUALIZADOR DE FOTO (NORMAL OU DUPLA 2X) + APAGAR -->
-    <div id="lightbox-modal" class="lightbox-modal hidden" role="dialog" aria-modal="true" aria-label="Visualizar foto">
+    <!-- MODAL: VISUALIZADOR DE FOTO EM TELA CHEIA (NORMAL OU DUPLA 2X) + APAGAR -->
+    <div id="lightbox-modal" class="lightbox-modal hidden" role="dialog" aria-modal="true" aria-label="Visualizar foto em tela cheia">
       <div class="lightbox-topbar">
         <span id="lightbox-badge" class="lightbox-badge hidden"></span>
         <div class="lightbox-top-actions">
+          <button id="lightbox-fullscreen-btn" type="button" class="lightbox-fs-btn" aria-label="Alternar tela cheia">
+            Tela cheia
+          </button>
           <button id="lightbox-delete-btn" type="button" class="lightbox-delete-btn hidden" aria-label="Apagar foto">
             Apagar
           </button>
@@ -339,6 +342,7 @@
         </div>
       </div>
       <img id="lightbox-img" class="lightbox-img" alt="Foto ampliada" />
+      <p id="lightbox-caption" class="lightbox-caption hidden"></p>
     </div>
 
     <!-- MODAL LEVE DE CONFIRMAÇÃO (LIMPAR CHAT / APAGAR FOTO) -->

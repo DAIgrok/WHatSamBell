@@ -205,8 +205,10 @@ const el = {
 
   lightboxModal: document.getElementById('lightbox-modal'),
   lightboxBadge: document.getElementById('lightbox-badge'),
+  lightboxFullscreenBtn: document.getElementById('lightbox-fullscreen-btn'),
   lightboxDeleteBtn: document.getElementById('lightbox-delete-btn'),
   lightboxImg: document.getElementById('lightbox-img'),
+  lightboxCaption: document.getElementById('lightbox-caption'),
   closeLightboxBtn: document.getElementById('close-lightbox-btn'),
 
   confirmModal: document.getElementById('confirm-modal'),
@@ -366,6 +368,13 @@ function showCallToast(text) {
 }
 
 function openConfirmModal(title, message, confirmLabel, callback) {
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  if (fsEl && fsEl === el.lightboxModal) {
+    try {
+      if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    } catch (_) {}
+  }
   el.confirmTitle.textContent = title;
   el.confirmMessage.textContent = message;
   el.confirmAcceptBtn.textContent = confirmLabel || 'Confirmar';
@@ -1441,9 +1450,7 @@ function removeMessageFromDom(msgId) {
   const row = el.messagesList.querySelector(`[data-id="${msgId}"]`);
   if (row) row.remove();
   if (state.activeLightboxMsg && state.activeLightboxMsg.id === msgId) {
-    state.activeLightboxMsg = null;
-    el.lightboxModal.classList.add('hidden');
-    el.lightboxImg.removeAttribute('src');
+    closeLightbox(true);
   }
   rebuildDayDividers();
   if (!el.messagesList.querySelector('.msg-row')) {
@@ -1843,11 +1850,17 @@ async function compressImageToJpeg(file) {
     let drawSource = null;
 
     if (typeof createImageBitmap === 'function') {
-      bitmap = await createImageBitmap(file);
-      sourceWidth = bitmap.width;
-      sourceHeight = bitmap.height;
-      drawSource = bitmap;
-    } else {
+      try {
+        bitmap = await createImageBitmap(file);
+        sourceWidth = bitmap.width;
+        sourceHeight = bitmap.height;
+        drawSource = bitmap;
+      } catch (_) {
+        bitmap = null;
+      }
+    }
+
+    if (!drawSource) {
       objectUrl = URL.createObjectURL(file);
       const img = await new Promise((resolve, reject) => {
         const image = new Image();
@@ -1888,6 +1901,15 @@ async function compressImageToJpeg(file) {
   }
 }
 
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+    reader.onerror = () => reject(new Error('Falha ao ler imagem'));
+    reader.readAsDataURL(blob);
+  });
+}
+
 function setPendingPhotoMode(mode) {
   state.pendingPhotoMode = mode === 'double' ? 'double' : 'normal';
   el.photoModeButtons.forEach((btn) => {
@@ -1910,15 +1932,26 @@ async function handlePhotoSelected(e) {
   revokePendingPhotoUrl();
 
   try {
-    const compressedBlob = await compressImageToJpeg(file);
-    state.pendingPhotoBlob = compressedBlob;
-    state.pendingPhotoPreviewUrl = URL.createObjectURL(compressedBlob);
+    let finalBlob = null;
+    try {
+      finalBlob = await compressImageToJpeg(file);
+    } catch (_) {
+      if (file.type && file.type.startsWith('image/') && file.size <= 4 * 1024 * 1024) {
+        finalBlob = file;
+      } else {
+        throw new Error('UNSUPPORTED_IMAGE');
+      }
+    }
+
+    state.pendingPhotoBlob = finalBlob;
+    state.pendingPhotoPreviewUrl = URL.createObjectURL(finalBlob);
     el.photoPreviewImg.src = state.pendingPhotoPreviewUrl;
-    const kb = Math.max(1, Math.round(compressedBlob.size / 1024));
+    const kb = Math.max(1, Math.round(finalBlob.size / 1024));
     el.photoSizeBadge.textContent = `Pronta (${kb} KB)`;
     el.confirmPhotoBtn.disabled = false;
   } catch (_) {
     closePhotoModal();
+    showChatAlert('Não foi possível abrir esta foto. Tente outra imagem.');
   }
 }
 
@@ -1939,49 +1972,101 @@ async function uploadAndSendPhoto() {
   el.confirmPhotoBtn.textContent = 'Enviando...';
 
   try {
-    const filePath = `photos/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
+    const contentType = blob.type && blob.type.startsWith('image/') ? blob.type : 'image/jpeg';
+    const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'jpg';
+    const filePath = `photos/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    let mediaUrl = '';
+
     const { error: uploadErr } = await state.supabase.storage
       .from('chat-media')
-      .upload(filePath, blob, { contentType: 'image/jpeg', cacheControl: '31536000' });
+      .upload(filePath, blob, { contentType, cacheControl: '31536000' });
 
-    if (uploadErr) throw uploadErr;
+    if (!uploadErr) {
+      const { data: pub } = state.supabase.storage.from('chat-media').getPublicUrl(filePath);
+      mediaUrl = pub && pub.publicUrl ? pub.publicUrl : '';
+    } else if (blob.size <= 450 * 1024) {
+      mediaUrl = await blobToDataUrl(blob);
+    } else {
+      throw uploadErr;
+    }
 
-    const { data: pub } = state.supabase.storage.from('chat-media').getPublicUrl(filePath);
+    if (!mediaUrl) throw new Error('URL da foto indisponível');
+
     const contentPayload = serializePhotoMeta(isDouble, 2, caption);
-
     const { data: inserted, error: msgErr } = await state.supabase
       .from('messages')
       .insert({
         sender_name: state.currentUser,
         content: contentPayload,
-        media_url: pub.publicUrl,
+        media_url: mediaUrl,
         media_type: 'image',
         is_read: false
       })
       .select('id, sender_name, content, media_url, media_type, is_read, read_at, created_at')
       .single();
 
-    if (!msgErr && inserted) {
+    if (msgErr) throw msgErr;
+
+    if (inserted) {
       appendMessage(inserted, true);
       appendCallChatMessage(inserted);
       broadcastMessage(inserted);
     }
     closePhotoModal();
-  } catch (_) {
-    el.photoSizeBadge.textContent = 'Erro ao enviar';
+  } catch (err) {
+    el.photoSizeBadge.textContent =
+      err && err.message ? `Erro: ${err.message.slice(0, 32)}` : 'Erro ao enviar';
   } finally {
     el.confirmPhotoBtn.disabled = false;
     el.confirmPhotoBtn.textContent = 'Enviar foto';
   }
 }
 
+function updateLightboxFullscreenBtnState() {
+  if (!el.lightboxFullscreenBtn) return;
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  const isFs = Boolean(fsEl && fsEl === el.lightboxModal);
+  el.lightboxFullscreenBtn.classList.toggle('active', isFs);
+  el.lightboxFullscreenBtn.textContent = isFs ? 'Sair tela cheia' : 'Tela cheia';
+}
+
+async function toggleLightboxFullscreen() {
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  if (fsEl) {
+    try {
+      if (document.exitFullscreen) await document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    } catch (_) {}
+    updateLightboxFullscreenBtnState();
+    return;
+  }
+
+  try {
+    if (el.lightboxModal.requestFullscreen) {
+      await el.lightboxModal.requestFullscreen();
+    } else if (el.lightboxModal.webkitRequestFullscreen) {
+      el.lightboxModal.webkitRequestFullscreen();
+    } else {
+      showMsgToast('Modo tela cheia expandido ativado.');
+    }
+  } catch (_) {}
+  updateLightboxFullscreenBtnState();
+}
+
 function openLightbox(msgOrUrl) {
+  el.lightboxModal.classList.remove('lightbox-ui-hidden');
+
   if (typeof msgOrUrl === 'string') {
     state.activeLightboxMsg = null;
     el.lightboxBadge.classList.add('hidden');
     el.lightboxDeleteBtn.classList.add('hidden');
+    if (el.lightboxCaption) {
+      el.lightboxCaption.textContent = '';
+      el.lightboxCaption.classList.add('hidden');
+    }
     el.lightboxImg.src = msgOrUrl;
     el.lightboxModal.classList.remove('hidden');
+    updateLightboxFullscreenBtnState();
     return;
   }
 
@@ -1992,6 +2077,16 @@ function openLightbox(msgOrUrl) {
   state.activeLightboxMsg = msg;
   el.lightboxImg.src = msg.media_url;
   el.lightboxDeleteBtn.classList.remove('hidden');
+
+  if (el.lightboxCaption) {
+    if (meta.caption) {
+      el.lightboxCaption.textContent = meta.caption;
+      el.lightboxCaption.classList.remove('hidden');
+    } else {
+      el.lightboxCaption.textContent = '';
+      el.lightboxCaption.classList.add('hidden');
+    }
+  }
 
   if (meta.isDouble) {
     const isMe = msg.sender_name === state.currentUser;
@@ -2006,17 +2101,33 @@ function openLightbox(msgOrUrl) {
   }
 
   el.lightboxModal.classList.remove('hidden');
+  updateLightboxFullscreenBtnState();
 }
 
-async function closeLightbox() {
+async function closeLightbox(skipViewDecrement = false) {
   const viewedMsg = state.activeLightboxMsg;
   state.activeLightboxMsg = null;
+
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  if (fsEl && fsEl === el.lightboxModal) {
+    try {
+      if (document.exitFullscreen) await document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    } catch (_) {}
+  }
+
   el.lightboxModal.classList.add('hidden');
+  el.lightboxModal.classList.remove('lightbox-ui-hidden');
   el.lightboxImg.removeAttribute('src');
   el.lightboxBadge.classList.add('hidden');
   el.lightboxDeleteBtn.classList.add('hidden');
+  if (el.lightboxCaption) {
+    el.lightboxCaption.textContent = '';
+    el.lightboxCaption.classList.add('hidden');
+  }
+  updateLightboxFullscreenBtnState();
 
-  if (!viewedMsg || viewedMsg.sender_name === state.currentUser) return;
+  if (skipViewDecrement || !viewedMsg || viewedMsg.sender_name === state.currentUser) return;
 
   const currentMsg = state.messageCache.get(viewedMsg.id) || viewedMsg;
   const meta = parsePhotoMeta(currentMsg);
@@ -2075,10 +2186,13 @@ async function deletePhotoMessage(msg) {
   const { error: delErr } = await state.supabase.from('messages').delete().eq('id', msg.id);
   if (delErr) {
     // Fallback caso o usuário ainda não tenha reaplicado o GRANT DELETE no Supabase
-    await state.supabase
+    const { error: updErr } = await state.supabase
       .from('messages')
       .update({ content: MSG_DELETED_MARKER, media_url: null, is_read: true })
       .eq('id', msg.id);
+    if (updErr) {
+      showChatAlert('Erro ao apagar foto no banco. Verifique sua conexão ou permissões do Supabase.');
+    }
   }
 
   if (mediaUrl) {
@@ -3704,7 +3818,14 @@ function bindEvents() {
   el.cancelPhotoBtn.addEventListener('click', closePhotoModal);
   el.confirmPhotoBtn.addEventListener('click', uploadAndSendPhoto);
 
-  el.closeLightboxBtn.addEventListener('click', closeLightbox);
+  el.closeLightboxBtn.addEventListener('click', () => closeLightbox(false));
+  if (el.lightboxFullscreenBtn) {
+    el.lightboxFullscreenBtn.addEventListener('click', toggleLightboxFullscreen);
+  }
+  el.lightboxImg.addEventListener('click', (e) => {
+    e.stopPropagation();
+    el.lightboxModal.classList.toggle('lightbox-ui-hidden');
+  });
   el.lightboxDeleteBtn.addEventListener('click', () => {
     const targetMsg = state.activeLightboxMsg;
     if (!targetMsg) return;
@@ -3716,7 +3837,7 @@ function bindEvents() {
     );
   });
   el.lightboxModal.addEventListener('click', (e) => {
-    if (e.target === el.lightboxModal) closeLightbox();
+    if (e.target === el.lightboxModal) closeLightbox(false);
   });
 
   // Áudio
@@ -3853,11 +3974,14 @@ function bindEvents() {
   window.addEventListener('resize', applyStageRotationVisual);
   window.addEventListener('orientationchange', applyStageRotationVisual);
 
-  document.addEventListener('fullscreenchange', () => {
-    const active = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
-    el.toggleFullscreenBtn.classList.toggle('active-feature', active);
+  const handleFullscreenChange = () => {
+    const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+    el.toggleFullscreenBtn.classList.toggle('active-feature', Boolean(fsEl && fsEl === el.videoOverlay));
+    updateLightboxFullscreenBtnState();
     setTimeout(applyStageRotationVisual, 60);
-  });
+  };
+  document.addEventListener('fullscreenchange', handleFullscreenChange);
+  document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
 
   // Sincroniza mensagens perdidas e marca como lidas ao voltar ao app
   document.addEventListener('visibilitychange', () => {
