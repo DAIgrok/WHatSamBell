@@ -1094,8 +1094,18 @@ function subscribeRealtime() {
         }
       }
     )
-    .on('broadcast', { event: 'new-message' }, ({ payload }) => {
-      if (payload) handleIncomingRealtimeMessage(payload);
+    .on('broadcast', { event: 'new-message' }, async ({ payload }) => {
+      if (!payload) return;
+      if (payload.syncRequired && payload.id && state.supabase) {
+        const { data } = await state.supabase
+          .from('messages')
+          .select('id, sender_name, content, media_url, media_type, is_read, read_at, created_at')
+          .eq('id', payload.id)
+          .maybeSingle();
+        if (data) handleIncomingRealtimeMessage(data);
+        return;
+      }
+      handleIncomingRealtimeMessage(payload);
     })
     .on('broadcast', { event: 'read-receipt' }, ({ payload }) => {
       if (payload && Array.isArray(payload.ids)) {
@@ -1464,8 +1474,17 @@ function renderPhotoContentIntoSlot(slot, msg) {
     img.alt = 'Foto enviada';
     img.decoding = 'async';
     img.addEventListener('click', () => openLightbox(msg));
+    let retried = false;
     img.addEventListener('error', () => {
       if (img.parentNode !== slot) return;
+      if (!retried && msg.media_url.startsWith('http')) {
+        retried = true;
+        const sep = msg.media_url.includes('?') ? '&' : '?';
+        setTimeout(() => {
+          if (img.parentNode === slot) img.src = `${msg.media_url}${sep}r=${Date.now()}`;
+        }, 800);
+        return;
+      }
       const fallback = document.createElement('div');
       fallback.className = 'msg-photo-fallback';
       fallback.textContent = 'Não foi possível carregar esta foto.';
@@ -1685,10 +1704,11 @@ function scrollToBottom(instant) {
 
 function broadcastMessage(msg) {
   if (!state.chatChannel || !msg) return;
+  const isLargePayload = typeof msg.media_url === 'string' && msg.media_url.length > 140000;
   state.chatChannel.send({
     type: 'broadcast',
     event: 'new-message',
-    payload: msg
+    payload: isLargePayload ? { id: msg.id, syncRequired: true } : msg
   });
 }
 
@@ -1816,26 +1836,47 @@ async function compressImageToJpeg(file, maxSidePx = IMAGE_MAX_SIDE_PX, jpegQual
 
     if (typeof createImageBitmap === 'function') {
       try {
-        bitmap = await createImageBitmap(file);
+        bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+      } catch (_) {
+        try {
+          bitmap = await createImageBitmap(file);
+        } catch (_) {
+          bitmap = null;
+        }
+      }
+      if (bitmap) {
         sourceWidth = bitmap.width;
         sourceHeight = bitmap.height;
         drawSource = bitmap;
-      } catch (_) {
-        bitmap = null;
       }
     }
 
     if (!drawSource) {
       objectUrl = URL.createObjectURL(file);
-      const img = await new Promise((resolve, reject) => {
-        const image = new Image();
-        image.onload = () => resolve(image);
-        image.onerror = reject;
-        image.src = objectUrl;
-      });
+      let img = null;
+      try {
+        img = await new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = reject;
+          image.src = objectUrl;
+        });
+      } catch (_) {
+        const dataUrl = await blobToDataUrl(file);
+        img = await new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = reject;
+          image.src = dataUrl;
+        });
+      }
       sourceWidth = img.naturalWidth;
       sourceHeight = img.naturalHeight;
       drawSource = img;
+    }
+
+    if (!sourceWidth || !sourceHeight) {
+      throw new Error('Dimensões inválidas');
     }
 
     const scale = Math.min(1, maxSidePx / Math.max(sourceWidth, sourceHeight));
@@ -1875,14 +1916,25 @@ function blobToDataUrl(blob) {
   });
 }
 
-async function verifyReadableMediaUrl(url) {
-  if (!url) return false;
-  try {
-    const res = await fetch(url, { method: 'GET', cache: 'no-store' });
-    return res.ok;
-  } catch (_) {
-    return false;
-  }
+function verifyReadableMediaUrl(url) {
+  if (!url) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const probe = new Image();
+    const timer = setTimeout(() => {
+      probe.onload = null;
+      probe.onerror = null;
+      resolve(false);
+    }, 4500);
+    probe.onload = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    probe.onerror = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    probe.src = url;
+  });
 }
 
 async function handlePhotoSelected(e) {
@@ -1890,9 +1942,11 @@ async function handlePhotoSelected(e) {
   e.target.value = '';
   if (!file) return;
 
+  el.photoPreviewImg.onerror = null;
+  el.photoPreviewImg.removeAttribute('src');
   el.photoModal.classList.remove('hidden');
   el.confirmPhotoBtn.disabled = true;
-  el.photoSizeBadge.textContent = 'Comprimindo...';
+  el.photoSizeBadge.textContent = 'Preparando...';
   el.photoCaptionInput.value = '';
   revokePendingPhotoUrl();
 
@@ -1901,11 +1955,8 @@ async function handlePhotoSelected(e) {
     try {
       finalBlob = await compressImageToJpeg(file);
     } catch (_) {
-      if (file.type && file.type.startsWith('image/') && file.size <= 4 * 1024 * 1024) {
-        finalBlob = file;
-      } else {
-        throw new Error('UNSUPPORTED_IMAGE');
-      }
+      // Sem restrição de formato/tamanho: aceita o arquivo diretamente
+      finalBlob = file;
     }
 
     state.pendingPhotoBlob = finalBlob;
@@ -1923,7 +1974,7 @@ async function handlePhotoSelected(e) {
     el.confirmPhotoBtn.disabled = false;
   } catch (_) {
     closePhotoModal();
-    showChatAlert('Não foi possível abrir esta foto. Tente outra imagem.');
+    showChatAlert('Não foi possível abrir esta foto.');
   }
 }
 
@@ -1945,7 +1996,13 @@ async function uploadAndSendPhoto() {
 
   try {
     const contentType = blob.type && blob.type.startsWith('image/') ? blob.type : 'image/jpeg';
-    const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'jpg';
+    const ext = contentType.includes('png')
+      ? 'png'
+      : contentType.includes('webp')
+        ? 'webp'
+        : contentType.includes('gif')
+          ? 'gif'
+          : 'jpg';
     const filePath = `photos/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     let mediaUrl = '';
 
@@ -1976,12 +2033,12 @@ async function uploadAndSendPhoto() {
           compactBlob = await compressImageToJpeg(blob, 760, 0.6);
         } catch (_) {}
       }
-      if (compactBlob.size > 180 * 1024) {
+      if (compactBlob.size > 220 * 1024) {
         try {
-          compactBlob = await compressImageToJpeg(compactBlob, 600, 0.5);
+          compactBlob = await compressImageToJpeg(compactBlob, 560, 0.52);
         } catch (_) {}
       }
-      if (compactBlob.size <= 320 * 1024) {
+      if (compactBlob.size <= 900 * 1024) {
         mediaUrl = await blobToDataUrl(compactBlob);
       } else if (uploadErr) {
         throw uploadErr;
