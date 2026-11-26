@@ -77,7 +77,6 @@ const state = {
 
   pendingPhotoBlob: null,
   pendingPhotoPreviewUrl: null,
-  pendingPhotoMode: 'normal', // 'normal' | 'double'
   activeLightboxMsg: null,
   confirmActionCallback: null,
 
@@ -198,15 +197,14 @@ const el = {
   photoModal: document.getElementById('photo-modal'),
   photoSizeBadge: document.getElementById('photo-size-badge'),
   photoPreviewImg: document.getElementById('photo-preview-img'),
-  photoModeButtons: document.querySelectorAll('[data-photo-mode]'),
   photoCaptionInput: document.getElementById('photo-caption-input'),
   cancelPhotoBtn: document.getElementById('cancel-photo-btn'),
   confirmPhotoBtn: document.getElementById('confirm-photo-btn'),
 
   lightboxModal: document.getElementById('lightbox-modal'),
-  lightboxBadge: document.getElementById('lightbox-badge'),
   lightboxFullscreenBtn: document.getElementById('lightbox-fullscreen-btn'),
   lightboxDeleteBtn: document.getElementById('lightbox-delete-btn'),
+  lightboxStatus: document.getElementById('lightbox-status'),
   lightboxImg: document.getElementById('lightbox-img'),
   lightboxCaption: document.getElementById('lightbox-caption'),
   closeLightboxBtn: document.getElementById('close-lightbox-btn'),
@@ -1025,9 +1023,7 @@ function handleIncomingRealtimeMessage(msg) {
         ? '📹 Chamada de vídeo'
         : '📞 Ligação de voz'
       : msg.media_type === 'image'
-        ? photoMeta.isDouble
-          ? '📷 Enviou uma foto 2x'
-          : '📷 Enviou uma foto'
+        ? '📷 Enviou uma foto'
         : msg.media_type === 'audio'
           ? '🎤 Enviou um áudio'
           : msg.content || 'Nova mensagem';
@@ -1461,58 +1457,27 @@ function removeMessageFromDom(msgId) {
 function renderPhotoContentIntoSlot(slot, msg) {
   slot.innerHTML = '';
   const meta = parsePhotoMeta(msg);
-  const isMe = msg.sender_name === state.currentUser;
 
-  if (meta.isDouble) {
-    const expired = meta.viewsLeft <= 0 || !msg.media_url;
-    const cardBtn = document.createElement('button');
-    cardBtn.type = 'button';
-    cardBtn.className = `photo-2x-card${expired ? ' expired' : ''}`;
-    cardBtn.disabled = expired;
-
-    const icon = document.createElement('span');
-    icon.className = 'photo-2x-icon';
-    icon.textContent = expired ? '0x' : `${meta.viewsLeft}x`;
-
-    const info = document.createElement('span');
-    info.className = 'photo-2x-info';
-
-    const title = document.createElement('span');
-    title.className = 'photo-2x-title';
-    title.textContent = expired
-      ? 'Foto expirada'
-      : isMe
-        ? 'Foto dupla (2x) enviada'
-        : 'Abrir foto (2x)';
-
-    const sub = document.createElement('span');
-    sub.className = 'photo-2x-sub';
-    if (expired) {
-      sub.textContent = 'Visualizada 2 vezes';
-    } else if (meta.viewsLeft === 2) {
-      sub.textContent = isMe ? '2 visualizações disponíveis' : 'Toque para ver (2 restantes)';
-    } else {
-      sub.textContent = 'Última visualização (1 restante)';
-    }
-
-    info.appendChild(title);
-    info.appendChild(sub);
-    cardBtn.appendChild(icon);
-    cardBtn.appendChild(info);
-
-    if (!expired) {
-      cardBtn.addEventListener('click', () => openLightbox(msg));
-    }
-    slot.appendChild(cardBtn);
-  } else if (msg.media_url) {
+  if (msg.media_url) {
     const img = document.createElement('img');
     img.className = 'msg-image';
-    img.src = msg.media_url;
     img.alt = 'Foto enviada';
-    img.loading = 'lazy';
     img.decoding = 'async';
     img.addEventListener('click', () => openLightbox(msg));
+    img.addEventListener('error', () => {
+      if (img.parentNode !== slot) return;
+      const fallback = document.createElement('div');
+      fallback.className = 'msg-photo-fallback';
+      fallback.textContent = 'Não foi possível carregar esta foto.';
+      img.replaceWith(fallback);
+    });
+    img.src = msg.media_url;
     slot.appendChild(img);
+  } else {
+    const fallback = document.createElement('div');
+    fallback.className = 'msg-photo-fallback';
+    fallback.textContent = 'Foto indisponível';
+    slot.appendChild(fallback);
   }
 
   const delBtn = document.createElement('button');
@@ -1792,7 +1757,7 @@ function appendCallChatMessage(msg) {
   if (msg.media_type === 'text') {
     textPreview = msg.content || '';
   } else if (msg.media_type === 'image') {
-    textPreview = meta.isDouble ? '📷 Foto dupla (2x)' : '📷 Foto';
+    textPreview = '📷 Foto';
   } else if (msg.media_type === 'audio') {
     textPreview = '🎤 Áudio no chat';
   }
@@ -1838,9 +1803,9 @@ function toggleCallChatOverlay() {
 }
 
 // ============================================================================
-// FOTOS: COMPRESSÃO CLIENT-SIDE VIA CANVAS + NORMAL / 2X / APAGAR
+// FOTOS: COMPRESSÃO CLIENT-SIDE VIA CANVAS + ENVIO DIRETO + TELA CHEIA + APAGAR
 // ============================================================================
-async function compressImageToJpeg(file) {
+async function compressImageToJpeg(file, maxSidePx = IMAGE_MAX_SIDE_PX, jpegQuality = IMAGE_JPEG_QUALITY) {
   let bitmap = null;
   let objectUrl = null;
 
@@ -1873,7 +1838,7 @@ async function compressImageToJpeg(file) {
       drawSource = img;
     }
 
-    const scale = Math.min(1, IMAGE_MAX_SIDE_PX / Math.max(sourceWidth, sourceHeight));
+    const scale = Math.min(1, maxSidePx / Math.max(sourceWidth, sourceHeight));
     const targetW = Math.max(1, Math.round(sourceWidth * scale));
     const targetH = Math.max(1, Math.round(sourceHeight * scale));
 
@@ -1888,7 +1853,7 @@ async function compressImageToJpeg(file) {
       canvas.toBlob(
         (b) => (b ? resolve(b) : reject(new Error('Falha na compressão'))),
         'image/jpeg',
-        IMAGE_JPEG_QUALITY
+        jpegQuality
       );
     });
 
@@ -1910,13 +1875,14 @@ function blobToDataUrl(blob) {
   });
 }
 
-function setPendingPhotoMode(mode) {
-  state.pendingPhotoMode = mode === 'double' ? 'double' : 'normal';
-  el.photoModeButtons.forEach((btn) => {
-    const active = btn.dataset.photoMode === state.pendingPhotoMode;
-    btn.classList.toggle('active', active);
-    btn.setAttribute('aria-pressed', String(active));
-  });
+async function verifyReadableMediaUrl(url) {
+  if (!url) return false;
+  try {
+    const res = await fetch(url, { method: 'GET', cache: 'no-store' });
+    return res.ok;
+  } catch (_) {
+    return false;
+  }
 }
 
 async function handlePhotoSelected(e) {
@@ -1924,7 +1890,6 @@ async function handlePhotoSelected(e) {
   e.target.value = '';
   if (!file) return;
 
-  setPendingPhotoMode('normal');
   el.photoModal.classList.remove('hidden');
   el.confirmPhotoBtn.disabled = true;
   el.photoSizeBadge.textContent = 'Comprimindo...';
@@ -1945,6 +1910,13 @@ async function handlePhotoSelected(e) {
 
     state.pendingPhotoBlob = finalBlob;
     state.pendingPhotoPreviewUrl = URL.createObjectURL(finalBlob);
+    el.photoPreviewImg.onerror = async () => {
+      el.photoPreviewImg.onerror = null;
+      try {
+        const dataUrl = await blobToDataUrl(finalBlob);
+        if (dataUrl) el.photoPreviewImg.src = dataUrl;
+      } catch (_) {}
+    };
     el.photoPreviewImg.src = state.pendingPhotoPreviewUrl;
     const kb = Math.max(1, Math.round(finalBlob.size / 1024));
     el.photoSizeBadge.textContent = `Pronta (${kb} KB)`;
@@ -1957,6 +1929,7 @@ async function handlePhotoSelected(e) {
 
 function closePhotoModal() {
   el.photoModal.classList.add('hidden');
+  el.photoPreviewImg.onerror = null;
   el.photoPreviewImg.removeAttribute('src');
   state.pendingPhotoBlob = null;
   revokePendingPhotoUrl();
@@ -1966,7 +1939,6 @@ async function uploadAndSendPhoto() {
   if (!state.pendingPhotoBlob || !state.supabase) return;
   const blob = state.pendingPhotoBlob;
   const caption = el.photoCaptionInput.value.trim();
-  const isDouble = state.pendingPhotoMode === 'double';
 
   el.confirmPhotoBtn.disabled = true;
   el.confirmPhotoBtn.textContent = 'Enviando...';
@@ -1983,21 +1955,48 @@ async function uploadAndSendPhoto() {
 
     if (!uploadErr) {
       const { data: pub } = state.supabase.storage.from('chat-media').getPublicUrl(filePath);
-      mediaUrl = pub && pub.publicUrl ? pub.publicUrl : '';
-    } else if (blob.size <= 450 * 1024) {
-      mediaUrl = await blobToDataUrl(blob);
-    } else {
-      throw uploadErr;
+      const candidatePublicUrl = pub && pub.publicUrl ? pub.publicUrl : '';
+      if (await verifyReadableMediaUrl(candidatePublicUrl)) {
+        mediaUrl = candidatePublicUrl;
+      } else {
+        const { data: signedData } = await state.supabase.storage
+          .from('chat-media')
+          .createSignedUrl(filePath, 60 * 60 * 24 * 365);
+        const signedUrl = signedData && signedData.signedUrl ? signedData.signedUrl : '';
+        if (await verifyReadableMediaUrl(signedUrl)) {
+          mediaUrl = signedUrl;
+        }
+      }
+    }
+
+    if (!mediaUrl) {
+      let compactBlob = blob;
+      if (compactBlob.size > 160 * 1024) {
+        try {
+          compactBlob = await compressImageToJpeg(blob, 760, 0.6);
+        } catch (_) {}
+      }
+      if (compactBlob.size > 180 * 1024) {
+        try {
+          compactBlob = await compressImageToJpeg(compactBlob, 600, 0.5);
+        } catch (_) {}
+      }
+      if (compactBlob.size <= 320 * 1024) {
+        mediaUrl = await blobToDataUrl(compactBlob);
+      } else if (uploadErr) {
+        throw uploadErr;
+      } else {
+        throw new Error('Bucket chat-media indisponível para leitura');
+      }
     }
 
     if (!mediaUrl) throw new Error('URL da foto indisponível');
 
-    const contentPayload = serializePhotoMeta(isDouble, 2, caption);
     const { data: inserted, error: msgErr } = await state.supabase
       .from('messages')
       .insert({
         sender_name: state.currentUser,
-        content: contentPayload,
+        content: caption || null,
         media_url: mediaUrl,
         media_type: 'image',
         is_read: false
@@ -2056,31 +2055,31 @@ async function toggleLightboxFullscreen() {
 function openLightbox(msgOrUrl) {
   el.lightboxModal.classList.remove('lightbox-ui-hidden');
 
+  let targetUrl = '';
+  let targetMsg = null;
+  let captionText = '';
+
   if (typeof msgOrUrl === 'string') {
-    state.activeLightboxMsg = null;
-    el.lightboxBadge.classList.add('hidden');
-    el.lightboxDeleteBtn.classList.add('hidden');
-    if (el.lightboxCaption) {
-      el.lightboxCaption.textContent = '';
-      el.lightboxCaption.classList.add('hidden');
-    }
-    el.lightboxImg.src = msgOrUrl;
-    el.lightboxModal.classList.remove('hidden');
-    updateLightboxFullscreenBtnState();
+    targetUrl = msgOrUrl;
+  } else if (msgOrUrl) {
+    const msg = state.messageCache.get(msgOrUrl.id) || msgOrUrl;
+    const meta = parsePhotoMeta(msg);
+    targetMsg = msg;
+    targetUrl = msg.media_url || '';
+    captionText = meta.caption || '';
+  }
+
+  if (!targetUrl) {
+    showMsgToast('Foto indisponível.');
     return;
   }
 
-  const msg = state.messageCache.get(msgOrUrl.id) || msgOrUrl;
-  const meta = parsePhotoMeta(msg);
-  if (!msg.media_url || (meta.isDouble && meta.viewsLeft <= 0)) return;
-
-  state.activeLightboxMsg = msg;
-  el.lightboxImg.src = msg.media_url;
-  el.lightboxDeleteBtn.classList.remove('hidden');
+  state.activeLightboxMsg = targetMsg;
+  el.lightboxDeleteBtn.classList.toggle('hidden', !targetMsg);
 
   if (el.lightboxCaption) {
-    if (meta.caption) {
-      el.lightboxCaption.textContent = meta.caption;
+    if (captionText) {
+      el.lightboxCaption.textContent = captionText;
       el.lightboxCaption.classList.remove('hidden');
     } else {
       el.lightboxCaption.textContent = '';
@@ -2088,24 +2087,31 @@ function openLightbox(msgOrUrl) {
     }
   }
 
-  if (meta.isDouble) {
-    const isMe = msg.sender_name === state.currentUser;
-    el.lightboxBadge.textContent = isMe
-      ? `Foto 2x (${meta.viewsLeft} restantes)`
-      : meta.viewsLeft === 2
-        ? 'Visualização 1 de 2'
-        : 'Última visualização (2 de 2)';
-    el.lightboxBadge.classList.remove('hidden');
-  } else {
-    el.lightboxBadge.classList.add('hidden');
+  if (el.lightboxStatus) {
+    el.lightboxStatus.textContent = 'Carregando foto...';
+    el.lightboxStatus.classList.remove('hidden');
+  }
+
+  el.lightboxImg.onload = () => {
+    if (el.lightboxStatus) el.lightboxStatus.classList.add('hidden');
+  };
+  el.lightboxImg.onerror = () => {
+    if (el.lightboxStatus) {
+      el.lightboxStatus.textContent = 'Não foi possível carregar esta foto.';
+      el.lightboxStatus.classList.remove('hidden');
+    }
+  };
+
+  el.lightboxImg.src = targetUrl;
+  if (el.lightboxImg.complete && el.lightboxImg.naturalWidth > 0 && el.lightboxStatus) {
+    el.lightboxStatus.classList.add('hidden');
   }
 
   el.lightboxModal.classList.remove('hidden');
   updateLightboxFullscreenBtnState();
 }
 
-async function closeLightbox(skipViewDecrement = false) {
-  const viewedMsg = state.activeLightboxMsg;
+async function closeLightbox() {
   state.activeLightboxMsg = null;
 
   const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
@@ -2118,54 +2124,19 @@ async function closeLightbox(skipViewDecrement = false) {
 
   el.lightboxModal.classList.add('hidden');
   el.lightboxModal.classList.remove('lightbox-ui-hidden');
+  el.lightboxImg.onload = null;
+  el.lightboxImg.onerror = null;
   el.lightboxImg.removeAttribute('src');
-  el.lightboxBadge.classList.add('hidden');
+  if (el.lightboxStatus) {
+    el.lightboxStatus.textContent = '';
+    el.lightboxStatus.classList.add('hidden');
+  }
   el.lightboxDeleteBtn.classList.add('hidden');
   if (el.lightboxCaption) {
     el.lightboxCaption.textContent = '';
     el.lightboxCaption.classList.add('hidden');
   }
   updateLightboxFullscreenBtnState();
-
-  if (skipViewDecrement || !viewedMsg || viewedMsg.sender_name === state.currentUser) return;
-
-  const currentMsg = state.messageCache.get(viewedMsg.id) || viewedMsg;
-  const meta = parsePhotoMeta(currentMsg);
-  if (!meta.isDouble || meta.viewsLeft <= 0) return;
-
-  const nextViews = Math.max(0, meta.viewsLeft - 1);
-  const nextContent = serializePhotoMeta(true, nextViews, meta.caption);
-  const nextMediaUrl = nextViews === 0 ? null : currentMsg.media_url;
-  const updatedMsg = {
-    ...currentMsg,
-    content: nextContent,
-    media_url: nextMediaUrl,
-    is_read: true
-  };
-
-  state.messageCache.set(currentMsg.id, updatedMsg);
-  updatePhotoMessageInDom(updatedMsg);
-
-  if (state.chatChannel) {
-    state.chatChannel.send({
-      type: 'broadcast',
-      event: 'photo-view-updated',
-      payload: updatedMsg
-    });
-  }
-
-  if (state.supabase) {
-    const updateData = {
-      content: nextContent,
-      is_read: true,
-      read_at: new Date().toISOString()
-    };
-    if (nextViews === 0) updateData.media_url = null;
-    await state.supabase.from('messages').update(updateData).eq('id', currentMsg.id);
-    if (nextViews === 0 && currentMsg.media_url) {
-      removeMediaFromStorage(currentMsg.media_url);
-    }
-  }
 }
 
 async function deletePhotoMessage(msg) {
@@ -3809,16 +3780,13 @@ function bindEvents() {
 
   el.sendBtn.addEventListener('click', sendTextMessage);
 
-  // Fotos: Normal, Visualização Dupla (2x) e Apagar
+  // Fotos: Envio direto, Tela cheia e Apagar
   el.photoBtn.addEventListener('click', () => el.photoInput.click());
   el.photoInput.addEventListener('change', handlePhotoSelected);
-  el.photoModeButtons.forEach((btn) => {
-    btn.addEventListener('click', () => setPendingPhotoMode(btn.dataset.photoMode));
-  });
   el.cancelPhotoBtn.addEventListener('click', closePhotoModal);
   el.confirmPhotoBtn.addEventListener('click', uploadAndSendPhoto);
 
-  el.closeLightboxBtn.addEventListener('click', () => closeLightbox(false));
+  el.closeLightboxBtn.addEventListener('click', () => closeLightbox());
   if (el.lightboxFullscreenBtn) {
     el.lightboxFullscreenBtn.addEventListener('click', toggleLightboxFullscreen);
   }
@@ -3837,7 +3805,7 @@ function bindEvents() {
     );
   });
   el.lightboxModal.addEventListener('click', (e) => {
-    if (e.target === el.lightboxModal) closeLightbox(false);
+    if (e.target === el.lightboxModal) closeLightbox();
   });
 
   // Áudio

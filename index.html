@@ -281,7 +281,7 @@
     <!-- Áudio único dedicado da chamada (zero eco/duplicação no Android) -->
     <audio id="remote-audio" autoplay playsinline></audio>
 
-    <!-- MODAL: PRÉVIA DE FOTO COMPRIMIDA + MODO NORMAL OU DUPLA (2X) -->
+    <!-- MODAL: PRÉVIA DE FOTO COMPRIMIDA -->
     <div id="photo-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Prévia da foto">
       <div class="modal-card">
         <div class="modal-header">
@@ -289,26 +289,7 @@
           <span id="photo-size-badge" class="size-badge">Comprimindo...</span>
         </div>
         <div class="photo-preview-wrap">
-          <img id="photo-preview-img" class="photo-preview-img" alt="Prévia da foto comprimida" />
-        </div>
-
-        <div class="photo-mode-selector" role="radiogroup" aria-label="Modo de visualização da foto">
-          <button
-            type="button"
-            class="photo-mode-btn active"
-            data-photo-mode="normal"
-            aria-pressed="true"
-          >
-            Visualização Normal
-          </button>
-          <button
-            type="button"
-            class="photo-mode-btn"
-            data-photo-mode="double"
-            aria-pressed="false"
-          >
-            Visualização Dupla (2x)
-          </button>
+          <img id="photo-preview-img" class="photo-preview-img" alt="Prévia da foto" />
         </div>
 
         <input
@@ -325,10 +306,9 @@
       </div>
     </div>
 
-    <!-- MODAL: VISUALIZADOR DE FOTO EM TELA CHEIA (NORMAL OU DUPLA 2X) + APAGAR -->
+    <!-- MODAL: VISUALIZADOR DE FOTO EM TELA CHEIA + APAGAR -->
     <div id="lightbox-modal" class="lightbox-modal hidden" role="dialog" aria-modal="true" aria-label="Visualizar foto em tela cheia">
       <div class="lightbox-topbar">
-        <span id="lightbox-badge" class="lightbox-badge hidden"></span>
         <div class="lightbox-top-actions">
           <button id="lightbox-fullscreen-btn" type="button" class="lightbox-fs-btn" aria-label="Alternar tela cheia">
             Tela cheia
@@ -341,6 +321,7 @@
           </button>
         </div>
       </div>
+      <p id="lightbox-status" class="lightbox-status hidden"></p>
       <img id="lightbox-img" class="lightbox-img" alt="Foto ampliada" />
       <p id="lightbox-caption" class="lightbox-caption hidden"></p>
     </div>
