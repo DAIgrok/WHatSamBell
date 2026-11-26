@@ -1474,21 +1474,41 @@ function renderPhotoContentIntoSlot(slot, msg) {
     img.alt = 'Foto enviada';
     img.decoding = 'async';
     img.addEventListener('click', () => openLightbox(msg));
-    let retried = false;
+    let retried = 0;
+    const showPhotoReloadFallback = () => {
+      const fallback = document.createElement('button');
+      fallback.type = 'button';
+      fallback.className = 'msg-photo-fallback';
+      fallback.textContent = 'Foto não carregou — toque para tentar novamente';
+      fallback.addEventListener('click', () => {
+        retried = 0;
+        const freshImg = document.createElement('img');
+        freshImg.className = 'msg-image';
+        freshImg.alt = 'Foto enviada';
+        freshImg.decoding = 'async';
+        freshImg.addEventListener('click', () => openLightbox(msg));
+        freshImg.addEventListener('error', () => {
+          if (freshImg.parentNode === slot) freshImg.replaceWith(fallback);
+        });
+        const sep = msg.media_url.includes('?') ? '&' : '?';
+        freshImg.src = msg.media_url.startsWith('http')
+          ? `${msg.media_url}${sep}r=${Date.now()}`
+          : msg.media_url;
+        fallback.replaceWith(freshImg);
+      });
+      img.replaceWith(fallback);
+    };
     img.addEventListener('error', () => {
       if (img.parentNode !== slot) return;
-      if (!retried && msg.media_url.startsWith('http')) {
-        retried = true;
+      if (retried < 2 && msg.media_url.startsWith('http')) {
+        retried += 1;
         const sep = msg.media_url.includes('?') ? '&' : '?';
         setTimeout(() => {
           if (img.parentNode === slot) img.src = `${msg.media_url}${sep}r=${Date.now()}`;
-        }, 800);
+        }, 900 * retried);
         return;
       }
-      const fallback = document.createElement('div');
-      fallback.className = 'msg-photo-fallback';
-      fallback.textContent = 'Não foi possível carregar esta foto.';
-      img.replaceWith(fallback);
+      showPhotoReloadFallback();
     });
     img.src = msg.media_url;
     slot.appendChild(img);
@@ -1836,12 +1856,20 @@ async function compressImageToJpeg(file, maxSidePx = IMAGE_MAX_SIDE_PX, jpegQual
 
     if (typeof createImageBitmap === 'function') {
       try {
-        bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+        bitmap = await createImageBitmap(file, {
+          imageOrientation: 'from-image',
+          resizeWidth: maxSidePx,
+          resizeQuality: 'medium'
+        });
       } catch (_) {
         try {
-          bitmap = await createImageBitmap(file);
+          bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
         } catch (_) {
-          bitmap = null;
+          try {
+            bitmap = await createImageBitmap(file);
+          } catch (_) {
+            bitmap = null;
+          }
         }
       }
       if (bitmap) {
@@ -1924,7 +1952,7 @@ function verifyReadableMediaUrl(url) {
       probe.onload = null;
       probe.onerror = null;
       resolve(false);
-    }, 4500);
+    }, 8000);
     probe.onload = () => {
       clearTimeout(timer);
       resolve(true);
@@ -1955,7 +1983,6 @@ async function handlePhotoSelected(e) {
     try {
       finalBlob = await compressImageToJpeg(file);
     } catch (_) {
-      // Sem restrição de formato/tamanho: aceita o arquivo diretamente
       finalBlob = file;
     }
 
@@ -1965,7 +1992,13 @@ async function handlePhotoSelected(e) {
       el.photoPreviewImg.onerror = null;
       try {
         const dataUrl = await blobToDataUrl(finalBlob);
-        if (dataUrl) el.photoPreviewImg.src = dataUrl;
+        if (dataUrl) {
+          el.photoPreviewImg.onerror = () => {
+            el.photoPreviewImg.onerror = null;
+            el.photoSizeBadge.textContent = 'Formato não exibido pelo navegador (tente JPG/PNG ou print)';
+          };
+          el.photoPreviewImg.src = dataUrl;
+        }
       } catch (_) {}
     };
     el.photoPreviewImg.src = state.pendingPhotoPreviewUrl;
@@ -2070,8 +2103,9 @@ async function uploadAndSendPhoto() {
     }
     closePhotoModal();
   } catch (err) {
-    el.photoSizeBadge.textContent =
-      err && err.message ? `Erro: ${err.message.slice(0, 32)}` : 'Erro ao enviar';
+    const msg = err && err.message ? err.message : 'Erro ao enviar foto';
+    el.photoSizeBadge.textContent = `Erro: ${msg.slice(0, 32)}`;
+    showChatAlert(`Erro ao enviar foto: ${msg}`);
   } finally {
     el.confirmPhotoBtn.disabled = false;
     el.confirmPhotoBtn.textContent = 'Enviar foto';

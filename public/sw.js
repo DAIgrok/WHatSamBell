@@ -7,8 +7,8 @@
    - Suporte completo a eventos Push e clique em notificações
    ============================================================================ */
 
-const CACHE_SHELL = 'nosso-mundo-shell-v11';
-const CACHE_STATIC = 'nosso-mundo-static-v11';
+const CACHE_SHELL = 'nosso-mundo-shell-v12';
+const CACHE_STATIC = 'nosso-mundo-static-v12';
 
 const PRECACHE_SHELL = ['/', '/index.html', '/style.css', '/app.js'];
 const PRECACHE_STATIC = [
@@ -95,7 +95,23 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // 3. CSS, JS e CDN Supabase -> Stale-While-Revalidate (responde do cache em <5ms)
+  // 3. CSS e JS locais -> Network-First (sempre entrega correções imediatas, com fallback offline)
+  if (url.origin === self.location.origin) {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          if (response && response.ok) {
+            const copy = response.clone();
+            caches.open(CACHE_SHELL).then((cache) => cache.put(request, copy));
+          }
+          return response;
+        })
+        .catch(() => caches.match(request))
+    );
+    return;
+  }
+
+  // 4. CDN Supabase -> Stale-While-Revalidate (responde do cache em <5ms)
   event.respondWith(
     caches.match(request).then((cached) => {
       const networkFetch = fetch(request)
